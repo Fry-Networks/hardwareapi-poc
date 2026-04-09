@@ -1,0 +1,22 @@
+[Unit]
+Description=Hardware EXE API Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/hardware_exe_api
+Environment=PATH=/opt/hardware_exe_api/.venv/bin
+Environment=PORT=8080
+Environment=HOST=0.0.0.0
+Environment=UVICORN_RELOAD=false
+ExecStart=/opt/hardware_exe_api/.venv/bin/python app.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hardware_exe_api
+
+[Install]
+WantedBy=multi-user.target

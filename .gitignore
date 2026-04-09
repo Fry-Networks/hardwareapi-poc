@@ -1,0 +1,36 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data and logs
+mongo-data/
+logs/
+*.log
+
+# Local persistent state (app-managed)
+deployment/banned_ips.json
+deployment/whitelist_ips.json
+
+# IDE/editor settings
+.idea/
+.vscode/
+.claude/
+
+# Backup files
+*.bak.*
+*.bak
+
+# OS clutter
+.DS_Store
+Thumbs.db

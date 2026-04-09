@@ -1,0 +1,15 @@
+[hardware_api]
+# Local jail for the Hardware API application logs
+# Place this file in /etc/fail2ban/jail.d/ or include via fail2ban config
+
+enabled  = true
+filter   = hardware_api
+action   = iptables[name=HW_API, port="http,https", protocol=tcp]
+logpath  = /opt/hardware_exe_api/logs/hardware_api_*.log
+maxretry = 5
+findtime = 600
+bantime  = 3600
+
+# Note: adjust maxretry/findtime/bantime to match your policy. The app already
+# includes an internal short-term block; this fail2ban jail provides a system
+# firewall-level ban that persists across app restarts.

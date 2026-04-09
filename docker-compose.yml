@@ -1,0 +1,31 @@
+services:
+  hardware_exe_api:
+    restart: unless-stopped
+    build:
+      context: .
+    ports:
+      - "8084:8084"
+    dns:
+      - 100.100.100.100
+      - 8.8.8.8
+    environment:
+      PORT: "8084"
+      HOST: "0.0.0.0"
+      UVICORN_RELOAD: "false"
+      TRUSTED_PROXY_IPS: "172.17.0.1,127.0.0.1,::1,100.96.170.14"
+      MONGO_CA_CERT_PATH: "/etc/ssl/mongo/mongo-ca.crt"
+      MONGODB_URI: "${MONGODB_URI:-op://HardwareAPI/Secrets/MONGO_URI}"
+      API_BEARER_TOKEN: "${API_BEARER_TOKEN:-op://HardwareAPI/Secrets/API_BEARER_TOKEN}"
+      API_BEARER_TOKEN_FLXTIME: "${API_BEARER_TOKEN_FLXTIME:-op://HardwareAPI/Secrets/API_BEARER_TOKEN_FLXTIME}"
+      API_BEARER_TOKEN_ADMIN: "${API_BEARER_TOKEN_ADMIN:-op://HardwareAPI/Secrets/API_BEARER_TOKEN_ADMIN}"
+      API_BEARER_TOKEN_DROPWIRELESS: "${API_BEARER_TOKEN_DROPWIRELESS:-op://HardwareAPI/Secrets/API_BEARER_TOKEN_DROPWIRELESS}"
+      FLXTIME_RATE_LIMIT: "100/minute"
+    secrets:
+      - op_service_account_token
+    volumes:
+      - ./logs:/app/logs
+      - /etc/ssl/mongo/mongo-ca.crt:/etc/ssl/mongo/mongo-ca.crt:ro
+
+secrets:
+  op_service_account_token:
+    file: /etc/opt/hardwareapi/op_service_account_token

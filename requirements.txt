@@ -1,0 +1,18 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# Optional: MongoDB backing store
+pymongo==4.4.0
+
+# Optional: load .env files into environment at process start
+python-dotenv==1.0.0
+
+# Rate limiting
+slowapi==0.1.9
+
+# Colored console output
+colorama==0.4.6
+
+# Measurement aggregation: hex → country lookup
+h3
+geopy
