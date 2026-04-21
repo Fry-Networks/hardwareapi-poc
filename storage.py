@@ -1087,6 +1087,11 @@ class MongoStore:
         doc["miner_key"] = miner_key
         self._hardware_docs.update_one({"miner_key": miner_key}, {"$set": doc}, upsert=True)
 
+    def get_version_for_miner_code(self, miner_code: str) -> Optional[Dict[str, Any]]:
+        if not miner_code:
+            return None
+        return self._versions.find_one({"miner_code": miner_code})
+
     # Presearch
     def put_presearch(self, ip: str, document: Dict[str, Any]) -> None:
         incoming_nodes = document.get("nodes", [])

@@ -27,6 +27,8 @@ services:
       PROBE_404_CONSEC_THRESHOLD: "12"
       SENSITIVE_WINDOW: "30"
       SENSITIVE_THRESHOLD: "3"
+      POC_LIVENESS_CUTOFF_DATE: "2026-04-20T00:00:00Z"
+      POC_LIVENESS_STALENESS_SECONDS: "86400"
       FLXTIME_RATE_LIMIT: "100/minute"
     secrets:
       - op_service_account_token

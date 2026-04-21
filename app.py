@@ -101,6 +101,7 @@ from models import (
     RewardsParamsResponse,
     VerifiedStatusResponse,
 )
+from poc_eligibility import compute_reward_eligible
 from storage import STORE
 
 # Configure logging with timestamps and file output
@@ -2255,6 +2256,9 @@ def put_hardware_doc(
     document = dict(payload.document)
     document.setdefault("miner_key", miner_key)
     document.setdefault("lastUpdated", utc_now().isoformat())
+    should_write, is_eligible = compute_reward_eligible(document, miner_key, STORE.get_version_for_miner_code)
+    if should_write:
+        document["reward_eligible"] = is_eligible
     STORE.put_hardware_doc(miner_key, document)
     return GenericOk()
 
