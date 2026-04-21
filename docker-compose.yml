@@ -13,6 +13,7 @@ services:
       HOST: "0.0.0.0"
       UVICORN_RELOAD: "false"
       TRUSTED_PROXY_IPS: "172.17.0.1,127.0.0.1,::1,100.96.170.14"
+      WHITELIST_IPS: "38.142.94.218,23.87.33.15,100.96.170.14"
       MONGO_CA_CERT_PATH: "/etc/ssl/mongo/mongo-ca.crt"
       MONGODB_URI: "${MONGODB_URI:-op://HardwareAPI/Secrets/MONGO_URI}"
       API_BEARER_TOKEN: "${API_BEARER_TOKEN:-op://HardwareAPI/Secrets/API_BEARER_TOKEN}"
