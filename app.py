@@ -797,7 +797,7 @@ import asyncio
 _probe_404_window = int(os.getenv("PROBE_404_WINDOW", "60"))
 _probe_404_threshold = int(os.getenv("PROBE_404_THRESHOLD", "20"))
 _probe_block_seconds = int(os.getenv("PROBE_BLOCK_SECONDS", "600"))
-_probe_404_consec_threshold = int(os.getenv("PROBE_404_CONSEC_THRESHOLD", "5"))
+_probe_404_consec_threshold = int(os.getenv("PROBE_404_CONSEC_THRESHOLD", "12"))
 
 # maps ip -> deque[timestamps_of_404s]
 _probe_404_counters: Dict[str, deque] = defaultdict(lambda: deque())
@@ -985,6 +985,22 @@ _sensitive_paths = [
     "/.gitlab-ci/.env",
     "/.env.example",
 ]
+# Paths exempted from 404 probe-counter increment — these are legitimate
+# client poll endpoints that routinely return 404 for unregistered or
+# stale miner_keys. Scanner detection continues for all other 404s.
+_exempt_404_prefixes = (
+    "/credentials/",
+    "/installations/",
+    "/versions/",
+    "/PoC/",
+)
+
+def _is_exempt_404_path(url_path: str) -> bool:
+    for prefix in _exempt_404_prefixes:
+        if url_path.startswith(prefix):
+            return True
+    return False
+
 # maps ip -> deque[timestamps_of_sensitive_tries]
 _sensitive_counters: Dict[str, deque] = defaultdict(lambda: deque())
 
@@ -1091,63 +1107,71 @@ async def log_requests(request: Request, call_next):
                     # Do not track or ban whitelisted IPs
                     pass
                 elif status_code == 404:
-                    dq = _probe_404_counters[client_ip]
                     now_ts = datetime.now().timestamp()
-                    # Emit a machine-parseable marker that fail2ban can watch for
-                    try:
-                        logging.getLogger("ExternalAPI.file").warning(f"FAILED_PROBE_404 ip={client_ip} path={url_path} ua=\"{user_agent or ''}\"")
-                    except Exception:
-                        # safe fallback if formatting fails
-                        logging.getLogger("ExternalAPI.file").warning("FAILED_PROBE_404 ip=%s path=%s", client_ip, url_path)
-                    dq.append(now_ts)
-                    # Trim old timestamps outside the window
-                    while dq and dq[0] < now_ts - _probe_404_window:
-                        dq.popleft()
-                    # Increment consecutive 404 counter
-                    c = (_probe_404_consec.get(client_ip, 0) + 1)
-                    _probe_404_consec[client_ip] = c
-                    # Check for sensitive path probes and handle immediate blocking
-                    try:
-                        for sensitive in _sensitive_paths:
-                            # simple substring match to catch variants
-                            if sensitive in url_path:
-                                sc = _sensitive_counters[client_ip]
-                                sc.append(now_ts)
-                                # trim old entries
-                                while sc and sc[0] < now_ts - _sensitive_window:
-                                    sc.popleft()
-                                if len(sc) >= _sensitive_threshold:
-                                    # immediate permanent block (persisted)
-                                    _probe_blocklist[client_ip] = float("inf")
-                                    _persist_add_ban(client_ip, reason="sensitive_probe")
-                                    logging.getLogger("ExternalAPI.file").warning(f"FAILED_SENSITIVE_PROBE ip={client_ip} path={url_path} count={len(sc)}")
-                                    logging.getLogger("ExternalAPI.console").warning(f"{client_ip} - [WARNING] - IP permanently blocked due to sensitive probes")
-                                    sc.clear()
-                                    dq.clear()
-                                    _probe_404_consec[client_ip] = 0
-                                    break
-                    except Exception:
-                        logging.getLogger("ExternalAPI.file").debug("sensitive probe detection failed for %s", client_ip)
-                    # Check consecutive 404 threshold
-                    if c >= _probe_404_consec_threshold:
-                        _probe_blocklist[client_ip] = float("inf")
-                        _persist_add_ban(client_ip, reason="404_consecutive")
-                        logging.getLogger("ExternalAPI.file").warning(f"FAILED_PROBE_CONSEC_404 ip={client_ip} count={c}")
-                        logging.getLogger("ExternalAPI.console").warning(f"{client_ip} - [WARNING] - IP permanently blocked due to {c} consecutive 404s")
-                        _probe_404_consec[client_ip] = 0
-                        dq.clear()
-                        _sensitive_counters[client_ip].clear()
-                    
-                    if len(dq) >= _probe_404_threshold:
-                        # Permanent block for repeated 404 probes (persisted)
-                        _probe_blocklist[client_ip] = float("inf")
-                        _persist_add_ban(client_ip, reason="404_threshold")
-                        # emit a fail2ban-friendly block marker as well (file-only)
-                        logging.getLogger("ExternalAPI.file").warning(f"FAILED_PROBE_BLOCK ip={client_ip} reason=404s count={len(dq)}")
-                        # user-visible console message (UA not included)
-                        logging.getLogger("ExternalAPI.console").warning(f"{client_ip} - [WARNING] - IP permanently blocked due to {len(dq)} 404s in {_probe_404_window}s")
-                        dq.clear()
-                        _probe_404_consec[client_ip] = 0
+                    # Exempt legitimate client poll paths from probe-counter logic.
+                    # These endpoints routinely return 404 for unregistered or
+                    # stale miner_keys during normal operation. Scanner detection
+                    # continues for all OTHER 404 paths (see _exempt_404_prefixes).
+                    if _is_exempt_404_path(url_path):
+                        # Legit 404; do not count toward probe detection.
+                        pass
+                    else:
+                        dq = _probe_404_counters[client_ip]
+                        # Emit a machine-parseable marker that fail2ban can watch for
+                        try:
+                            logging.getLogger("ExternalAPI.file").warning(f"FAILED_PROBE_404 ip={client_ip} path={url_path} ua=\"{user_agent or ''}\"")
+                        except Exception:
+                            # safe fallback if formatting fails
+                            logging.getLogger("ExternalAPI.file").warning("FAILED_PROBE_404 ip=%s path=%s", client_ip, url_path)
+                        dq.append(now_ts)
+                        # Trim old timestamps outside the window
+                        while dq and dq[0] < now_ts - _probe_404_window:
+                            dq.popleft()
+                        # Increment consecutive 404 counter
+                        c = (_probe_404_consec.get(client_ip, 0) + 1)
+                        _probe_404_consec[client_ip] = c
+                        # Check for sensitive path probes and handle immediate blocking
+                        try:
+                            for sensitive in _sensitive_paths:
+                                # simple substring match to catch variants
+                                if sensitive in url_path:
+                                    sc = _sensitive_counters[client_ip]
+                                    sc.append(now_ts)
+                                    # trim old entries
+                                    while sc and sc[0] < now_ts - _sensitive_window:
+                                        sc.popleft()
+                                    if len(sc) >= _sensitive_threshold:
+                                        # timed block (persisted)
+                                        _probe_blocklist[client_ip] = now_ts + _probe_block_seconds
+                                        _persist_add_ban(client_ip, reason="sensitive_probe")
+                                        logging.getLogger("ExternalAPI.file").warning(f"FAILED_SENSITIVE_PROBE ip={client_ip} path={url_path} count={len(sc)}")
+                                        logging.getLogger("ExternalAPI.console").warning(f"{client_ip} - [WARNING] - IP blocked {_probe_block_seconds}s due to sensitive probes")
+                                        sc.clear()
+                                        dq.clear()
+                                        _probe_404_consec[client_ip] = 0
+                                        break
+                        except Exception:
+                            logging.getLogger("ExternalAPI.file").debug("sensitive probe detection failed for %s", client_ip)
+                        # Check consecutive 404 threshold
+                        if c >= _probe_404_consec_threshold:
+                            _probe_blocklist[client_ip] = now_ts + _probe_block_seconds
+                            _persist_add_ban(client_ip, reason="404_consecutive")
+                            logging.getLogger("ExternalAPI.file").warning(f"FAILED_PROBE_CONSEC_404 ip={client_ip} count={c}")
+                            logging.getLogger("ExternalAPI.console").warning(f"{client_ip} - [WARNING] - IP blocked {_probe_block_seconds}s due to {c} consecutive 404s")
+                            _probe_404_consec[client_ip] = 0
+                            dq.clear()
+                            _sensitive_counters[client_ip].clear()
+
+                        if len(dq) >= _probe_404_threshold:
+                            # Timed block for repeated 404 probes (persisted)
+                            _probe_blocklist[client_ip] = now_ts + _probe_block_seconds
+                            _persist_add_ban(client_ip, reason="404_threshold")
+                            # emit a fail2ban-friendly block marker as well (file-only)
+                            logging.getLogger("ExternalAPI.file").warning(f"FAILED_PROBE_BLOCK ip={client_ip} reason=404s count={len(dq)}")
+                            # user-visible console message (UA not included)
+                            logging.getLogger("ExternalAPI.console").warning(f"{client_ip} - [WARNING] - IP blocked {_probe_block_seconds}s due to {len(dq)} 404s in {_probe_404_window}s")
+                            dq.clear()
+                            _probe_404_consec[client_ip] = 0
                 else:
                     # For other 4xx codes we might optionally clear counters or ignore
                     _probe_404_consec[client_ip] = 0

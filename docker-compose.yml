@@ -20,6 +20,13 @@ services:
       API_BEARER_TOKEN_FLXTIME: "${API_BEARER_TOKEN_FLXTIME:-op://HardwareAPI/Secrets/API_BEARER_TOKEN_FLXTIME}"
       API_BEARER_TOKEN_ADMIN: "${API_BEARER_TOKEN_ADMIN:-op://HardwareAPI/Secrets/API_BEARER_TOKEN_ADMIN}"
       API_BEARER_TOKEN_DROPWIRELESS: "${API_BEARER_TOKEN_DROPWIRELESS:-op://HardwareAPI/Secrets/API_BEARER_TOKEN_DROPWIRELESS}"
+      # Probe detection thresholds (exempt paths handled in app.py)
+      PROBE_404_WINDOW: "60"
+      PROBE_404_THRESHOLD: "20"
+      PROBE_BLOCK_SECONDS: "3600"
+      PROBE_404_CONSEC_THRESHOLD: "12"
+      SENSITIVE_WINDOW: "30"
+      SENSITIVE_THRESHOLD: "3"
       FLXTIME_RATE_LIMIT: "100/minute"
     secrets:
       - op_service_account_token
