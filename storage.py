@@ -18,6 +18,14 @@ except Exception as e:
     get_aggregator = None  # type: ignore
 
 try:
+    from algo_wallet import generate_device_wallet, encrypt_mnemonic, decrypt_mnemonic
+except Exception as e:  # pragma: no cover - optional dependency
+    logging.warning(f"Algo wallet module not available: {e}")
+    generate_device_wallet = None  # type: ignore
+    encrypt_mnemonic = None  # type: ignore
+    decrypt_mnemonic = None  # type: ignore
+
+try:
     from pymongo import MongoClient
     from pymongo import ReturnDocument
     from pymongo.collection import Collection
@@ -235,18 +243,12 @@ class InMemoryStore:
 
     # ------------------------------------------------------------------
     # Miner credentials
-    def get_miner_profile(self, miner_key: str) -> Dict[str, Any]:
-        with self._lock:
-            return dict(self._miner_profiles.get(miner_key, {"exists": False}))
-
     def set_miner_profile(self, miner_key: str, **fields: Any) -> None:
         with self._lock:
             profile = self._miner_profiles.setdefault(miner_key, {"exists": False})
             profile.update(fields)
             profile["exists"] = True
 
-    # ------------------------------------------------------------------
-    # Installation heartbeats
     def upsert_installation(self, miner_key: str, install_id: str, payload: Dict[str, Any]) -> None:
         with self._lock:
             rec = InstallationRecord(miner_key=miner_key, install_id=install_id, payload=dict(payload))
@@ -527,7 +529,9 @@ class MongoStore:
         # Fallback: main database devices (admin panel records)
         main_db = self._client.get_database("main")
         self._main_devices: Collection = main_db.get_collection("devices")
-    
+
+        self._merkle_trees: Collection = poc_db.get_collection("merkle_trees")
+
     def _get_measurements_collection(self, country: str) -> Collection:
         """Get or create measurements collection for a specific country.
         
@@ -714,6 +718,7 @@ class MongoStore:
 
     # Miner profiles - always use creds.hardware collection
     def get_miner_profile(self, miner_key: str) -> Dict[str, Any]:
+        doc = None
         try:
             # First try miner_profiles collection
             doc = self._miner_profiles.find_one({"miner_key": miner_key}) or self._miner_profiles.find_one({"minerKey": miner_key})
@@ -721,35 +726,48 @@ class MongoStore:
                 doc = dict(doc)
                 doc.pop("_id", None)
                 doc.setdefault("exists", True)
-                return doc
             
-            # If not found, try installations collection
-            doc = self._installations.find_one({"miner_key": miner_key})
-            if doc:
-                doc = dict(doc)
-                doc.pop("_id", None)
-                doc.setdefault("exists", True)
-                return doc
+            if not doc:
+                # If not found, try installations collection
+                doc = self._installations.find_one({"miner_key": miner_key})
+                if doc:
+                    doc = dict(doc)
+                    doc.pop("_id", None)
+                    doc.setdefault("exists", True)
             
-            # If not found, try hardware collection
-            doc = self._hardware_docs.find_one({"miner_key": miner_key}) or self._hardware_docs.find_one({"minerKey": miner_key})
-            if doc:
-                doc = dict(doc)
-                doc.pop("_id", None)
-                doc.setdefault("exists", True)
-                return doc
+            if not doc:
+                # If not found, try hardware collection
+                doc = self._hardware_docs.find_one({"miner_key": miner_key}) or self._hardware_docs.find_one({"minerKey": miner_key})
+                if doc:
+                    doc = dict(doc)
+                    doc.pop("_id", None)
+                    doc.setdefault("exists", True)
             
-            # Fallback 4: Check main.devices (admin panel device records)
-            doc = self._main_devices.find_one({"miner_key": miner_key}) or self._main_devices.find_one({"minerKey": miner_key})
-            if doc:
-                doc = dict(doc)
-                doc.pop("_id", None)
-                doc.setdefault("exists", True)
-                return doc
+            if not doc:
+                # Fallback 4: Check main.devices (admin panel device records)
+                doc = self._main_devices.find_one({"miner_key": miner_key}) or self._main_devices.find_one({"minerKey": miner_key})
+                if doc:
+                    doc = dict(doc)
+                    doc.pop("_id", None)
+                    doc.setdefault("exists", True)
         except Exception:
             pass
 
-        return {"exists": False}
+        if not doc:
+            return {"exists": False}
+
+        # Decrypt mnemonic if present; never expose encrypted fields
+        enc = doc.pop("algo_mnemonic_enc", None)
+        nonce = doc.pop("algo_mnemonic_nonce", None)
+        doc.pop("algo_mnemonic_iv", None)
+        doc.pop("algo_mnemonic_tag", None)
+        if enc and nonce and doc.get("algo_address") and decrypt_mnemonic:
+            try:
+                doc["algo_mnemonic"] = decrypt_mnemonic(enc, nonce)
+            except Exception:
+                pass
+
+        return doc
 
     def set_miner_profile(self, miner_key: str, **fields: Any) -> None:
         payload = dict(fields)
@@ -758,6 +776,24 @@ class MongoStore:
         self._miner_profiles.update_one({"miner_key": miner_key}, {"$set": payload}, upsert=True)
 
     # Installations
+    def ensure_algo_wallet(self, miner_key: str) -> None:
+        """Idempotent: generate and store Algorand wallet for device if not already provisioned."""
+        existing = self._installations.find_one(
+            {"miner_key": miner_key}, {"algo_address": 1}
+        )
+        if existing and existing.get("algo_address"):
+            return  # Already provisioned
+        wallet = generate_device_wallet()
+        enc = encrypt_mnemonic(wallet["mnemonic"])
+        self._installations.update_many(
+            {"miner_key": miner_key},
+            {"$set": {
+                "algo_address": wallet["address"],
+                "algo_mnemonic_enc": enc["enc"],
+                "algo_mnemonic_nonce": enc["nonce"],
+            }}
+        )
+
     def upsert_installation(self, miner_key: str, install_id: str, payload: Dict[str, Any]) -> None:
         key = {"miner_key": miner_key, "install_id": install_id}
         payload_copy = dict(payload)
@@ -1276,6 +1312,27 @@ class MongoStore:
         doc = dict(doc)
         doc.pop("_id", None)
         return doc
+
+    # ---- Merkle tree storage ----
+
+    def get_merkle_tree(self, epoch: int) -> Optional[Dict[str, Any]]:
+        doc = self._merkle_trees.find_one({"epoch": epoch})
+        if not doc:
+            return None
+        doc = dict(doc)
+        doc.pop("_id", None)
+        return doc
+
+    def put_merkle_tree(self, epoch: int, tree_data: Dict[str, Any]) -> None:
+        tree_data["epoch"] = epoch
+        self._merkle_trees.replace_one(
+            {"epoch": epoch},
+            tree_data,
+            upsert=True,
+        )
+
+    def list_merkle_epochs(self) -> List[int]:
+        return [d["epoch"] for d in self._merkle_trees.find({}, {"epoch": 1})]
 
 
 # MongoDB store is required - no fallback

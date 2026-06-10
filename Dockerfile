@@ -21,8 +21,12 @@ COPY op-entrypoint.sh /usr/local/bin/op-entrypoint
 RUN chmod 0755 /usr/local/bin/op-entrypoint \
     && chown app:app /usr/local/bin/op-entrypoint /usr/local/bin/op
 
-COPY --chown=app:app app.py models.py storage.py measurement_aggregator.py poc_eligibility.py /app/
+COPY --chown=app:app app.py models.py storage.py measurement_aggregator.py poc_eligibility.py algo_wallet.py /app/
 COPY --chown=app:app deployment /app/deployment
+COPY --chown=app:app calculator /app/calculator
+COPY --chown=app:app schemas /app/schemas
+COPY --chown=app:app routes /app/routes
+COPY --chown=app:app tests /app/tests
 
 RUN mkdir -p /app/logs \
     && chown -R app:app /app

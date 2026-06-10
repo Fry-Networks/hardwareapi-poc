@@ -96,6 +96,7 @@ from models import (
     MeasurementRecord,
     MysteriumKeystoreRequest,
     MysteriumKeystoreResponse,
+    MigrationRequest,
     PresearchPayload,
     RewardsParamsRequest,
     RewardsParamsResponse,
@@ -267,6 +268,9 @@ limiter = Limiter(key_func=get_remote_address, default_limits=[])
 
 # Bearer token security schemes for protected endpoints
 bearer_scheme = HTTPBearer(auto_error=False)
+
+# Merkle proof router (imported here to avoid circular imports; limiter already defined)
+from routes.merkle import router as merkle_router
 
 
 def verify_bearer_token_flxtime(request: Request, credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -> str:
@@ -785,6 +789,8 @@ app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=_trusted_proxies)  # ty
 _trusted_proxy_set: set = set()
 if isinstance(_trusted_proxies, list):
     _trusted_proxy_set = set(_trusted_proxies)
+
+app.include_router(merkle_router)
 
 # Simple in-process tracker for repeated 404 probes and a temporary blocklist.
 # This is intended as a lightweight mitigation for opportunistic scanners.
@@ -1985,6 +1991,15 @@ def upsert_installation(
     payload = heartbeat.model_dump()
     payload.setdefault("last_seen_at", utc_now().isoformat())
     STORE.upsert_installation(miner_key, install_id, payload)
+    # Provision Algorand wallet for FEM/RDN miners (idempotent)
+    if miner_key.startswith(("FEM-", "RDN-")):
+        try:
+            STORE.ensure_algo_wallet(miner_key)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(
+                "algo_wallet_provision_failed miner_key=%s err=%s", miner_key, e
+            )
     return GenericOk()
 
 
@@ -2066,6 +2081,51 @@ def delete_installation(
         )
     return GenericOk()
 
+
+
+
+# --- FEM Migration: old-key deactivation ---
+_FEM_KEY_RE = re.compile(r'^FEM-[a-fA-F0-9]{32}$')
+_OLD_KEY_RE = re.compile(r'^(BM|AEM|RDN|SDN|SVN)-[a-fA-F0-9]{32}$')
+
+
+@app.post(
+    "/devices/migrate",
+    response_model=GenericOk,
+    status_code=status.HTTP_200_OK,
+    summary="Deactivate old miner keys on FEM migration",
+    tags=["Devices"],
+)
+def retire_devices_for_migration(
+    payload: MigrationRequest,
+    token: str = Depends(verify_bearer_token_general),
+) -> GenericOk:
+    """Mark old miner keys as migrated-to-FEM.
+
+    Sets is_registered=False and reward_eligible=False for each old key.
+    Idempotent -- safe to call multiple times with the same payload.
+    """
+    # Input validation
+    if not _FEM_KEY_RE.match(payload.fem_key):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"fem_key must match FEM-[a-fA-F0-9]{{32}}: {payload.fem_key!r}",
+        )
+    if len(payload.old_keys) > 20:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"old_keys must have at most 20 entries, got {len(payload.old_keys)}",
+        )
+    for old_key in payload.old_keys:
+        if not _OLD_KEY_RE.match(old_key):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"old_key must match (BM|AEM|RDN|SDN|SVN)-[a-fA-F0-9]{{32}}: {old_key!r}",
+            )
+    # Deactivate
+    for old_key in payload.old_keys:
+        STORE.retire_device_for_migration(old_key, payload.fem_key)
+    return GenericOk()
 
 @app.get(
     "/installations/ip/{external_ip}/status",

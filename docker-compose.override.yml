@@ -1,0 +1,4 @@
+services:
+  hardware_exe_api:
+    environment:
+      MERKLE_TREE_CACHE_SIZE: "10"
