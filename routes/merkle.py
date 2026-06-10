@@ -133,3 +133,23 @@ def post_merkle_tree(
         del _merkle_cache[epoch]
 
     return {"status": "ok", "epoch": epoch, "wallet_count": len(wallets)}
+
+
+@router.get("/api/merkle/root", tags=["Health"])
+@_router_limiter.limit("30/minute")
+def get_merkle_root(
+    request: Request,
+    epoch: int = Query(0, description="Reward epoch"),
+) -> Dict[str, Any]:
+    """Return merkle root metadata for an epoch."""
+    tree_pair = _get_tree(epoch)
+    if tree_pair is None:
+        return {"eligible": False, "epoch": epoch}
+
+    tree_data, tree, wallet_index = tree_pair
+    return {
+        "epoch": epoch,
+        "root": tree_data["root"],
+        "wallet_count": tree_data.get("wallet_count", len(tree_data["wallets"])),
+    }
+
