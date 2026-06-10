@@ -10,13 +10,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+import hmac
 
 from calculator.merkle_tree import MerkleTree
 from storage import STORE
 
 router = APIRouter()
+
+def _client_key(request):
+    secret = os.environ.get("FRY_PROXY_KEY", "")
+    supplied = request.headers.get("x-fry-proxy-key", "")
+    xff = request.headers.get("x-forwarded-for", "")
+    if secret and supplied and hmac.compare_digest(supplied, secret) and xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 # Decoration-only limiter; RateLimitExceeded is handled by app-level exception handler
-_router_limiter = Limiter(key_func=get_remote_address)
+_router_limiter = Limiter(key_func=_client_key)
 
 MERKLE_TREE_CACHE_SIZE = int(os.getenv("MERKLE_TREE_CACHE_SIZE", "10"))
 _merkle_cache: OrderedDict[int, tuple[Dict[str, Any], MerkleTree, Dict[str, int]]] = OrderedDict()
@@ -54,7 +64,7 @@ def _get_tree(epoch: int) -> Optional[tuple[Dict[str, Any], MerkleTree, Dict[str
 
 
 @router.get("/api/merkle/proof")
-@_router_limiter.limit("30/minute")
+@_router_limiter.limit("60/minute")
 def get_merkle_proof(
     request: Request,
     wallet: str = Query(..., description="Algorand wallet address"),
