@@ -16,3 +16,6 @@ colorama==0.4.6
 # Measurement aggregation: hex → country lookup
 h3
 geopy
+# Algorand wallet provisioning
+py-algorand-sdk==2.7.0
+cryptography>=42.0.0

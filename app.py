@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+import hashlib
 import importlib.util
 import logging
 import os
 from pathlib import Path as PathLib
+import secrets
 import sys
 import re
 import ipaddress
@@ -90,6 +92,7 @@ from models import (
     InstallerSupportResponse,
     MinerCode,
     MinerCodeOrAll,
+    RegistrationResponse,
     UpdateVersionRequest,
     MeasurementUpload,
     MeasurementListResponse,
@@ -104,6 +107,15 @@ from models import (
 )
 from poc_eligibility import compute_reward_eligible
 from storage import STORE
+
+
+def generate_device_token() -> str:
+    return f"fem_{secrets.token_hex(32)}"
+
+
+def hash_device_token(token: str) -> str:
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
 
 # Configure logging with timestamps and file output
 def setup_logging():
@@ -453,6 +465,37 @@ def verify_bearer_token_leases(request: Request, credentials: HTTPAuthorizationC
         detail="Invalid authentication token",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def verify_device_or_shared_token(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> str:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing authorization")
+    token = credentials.credentials
+    shared = os.environ.get("API_BEARER_TOKEN", "")
+    if shared and token == shared:
+        return token
+    if token.startswith("fem_") and len(token) == 68:
+        if STORE.verify_device_token(hash_device_token(token)):
+            return token
+    raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def verify_device_or_lease_token(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> str:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing authorization")
+    token = credentials.credentials
+    for env_key in ("API_BEARER_TOKEN", "API_BEARER_TOKEN_DROPWIRELESS"):
+        shared = os.environ.get(env_key, "")
+        if shared and token == shared:
+            return token
+    if token.startswith("fem_") and len(token) == 68:
+        if STORE.verify_device_token(hash_device_token(token)):
+            return token
+    raise HTTPException(status_code=401, detail="Invalid token")
 
 
 _openapi_full = None
@@ -1754,7 +1797,7 @@ def admin_refresh_openapi(token: str = Depends(verify_bearer_token_admin)) -> Di
 def get_required_version(
     miner_code: MinerCode = Path(...),
     platform: Optional[str] = Query(None, description="Optional platform filter ('windows', 'linux', 'test-windows', 'test-linux')"),
-    token: str = Depends(verify_bearer_token_general)
+    token: str = Depends(verify_device_or_shared_token)
 ) -> VersionResponse:
     try:
         normalized_platform = None
@@ -1783,6 +1826,9 @@ def get_required_version(
             filtered[normalized_platform] = platform_section
         else:
             filtered["detail"] = f"No version data for platform '{normalized_platform}'"
+        # Pass base_reward through platform filter
+        if 'base_reward' in version_data:
+            filtered['base_reward'] = version_data['base_reward']
         return VersionResponse(**filtered)
 
     return VersionResponse(**version_data)
@@ -1796,7 +1842,7 @@ def get_required_version(
 )
 def list_supported_installers(
     os: str = Path(..., description="Operating system identifier (e.g., 'windows', 'linux', 'test-windows', 'test-linux')"),
-    token: str = Depends(verify_bearer_token_general)
+    token: str = Depends(verify_device_or_shared_token)
 ) -> InstallerSupportResponse:
     normalized = (os or "").strip().lower()
     if not normalized:
@@ -1910,7 +1956,7 @@ def update_rewards_params(
 )
 def get_miner_profile(
     miner_key: str = Path(..., description="Full miner key"),
-    token: str = Depends(verify_bearer_token_general)
+    token: str = Depends(verify_device_or_shared_token)
 ) -> MinerProfileResponse:
     profile = STORE.get_miner_profile(miner_key)
     if not profile.get("exists"):
@@ -1954,7 +2000,7 @@ def check_miner_exists(
 )
 def get_miner_verified_status(
     miner_key: str = Path(..., description="Full miner key"),
-    token: str = Depends(verify_bearer_token_general)
+    token: str = Depends(verify_device_or_shared_token)
 ) -> VerifiedStatusResponse:
     """Get the verification status of a miner.
 
@@ -1975,7 +2021,7 @@ def get_miner_verified_status(
 
 @app.post(
     "/installations/{miner_key}/installations/{install_id}",
-    response_model=GenericOk,
+    response_model=RegistrationResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Upsert installation heartbeat",
     tags=["Installations"],
@@ -1984,23 +2030,43 @@ def upsert_installation(
     miner_key: str,
     install_id: str,
     heartbeat: InstallationHeartbeat,
-    token: str = Depends(verify_bearer_token_general)
-) -> GenericOk:
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)
+) -> RegistrationResponse:
     if heartbeat.miner_key != miner_key or heartbeat.install_id != install_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Body miner identity mismatch")
+
+    is_fem = bool(re.match(r'^FEM-[a-fA-F0-9]{32}$', miner_key))
+    if not is_fem:
+        expected = os.environ.get("API_BEARER_TOKEN", "")
+        if not credentials or credentials.credentials != expected:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
     payload = heartbeat.model_dump()
     payload.setdefault("last_seen_at", utc_now().isoformat())
+
+    device_token: Optional[str] = None
+    if is_fem:
+        device_token = generate_device_token()
+        payload["device_token_hash"] = hash_device_token(device_token)
+
     STORE.upsert_installation(miner_key, install_id, payload)
     # Provision Algorand wallet for FEM/RDN miners (idempotent)
     if miner_key.startswith(("FEM-", "RDN-")):
         try:
             STORE.ensure_algo_wallet(miner_key)
+            STORE.ensure_mystnodes_token(miner_key)
         except Exception as e:
             import logging
             logging.getLogger(__name__).error(
                 "algo_wallet_provision_failed miner_key=%s err=%s", miner_key, e
             )
-    return GenericOk()
+    if is_fem:
+        return RegistrationResponse(status="ok", device_token=device_token)
+    return RegistrationResponse(status="ok")
 
 
 @app.get(
@@ -2066,7 +2132,7 @@ def query_measurements(
 def delete_installation(
     miner_key: str,
     install_id: str,
-    token: str = Depends(verify_bearer_token_general)
+    token: str = Depends(verify_device_or_shared_token)
 ) -> GenericOk:
     """Remove an installation record when a miner is uninstalled from a device.
     
@@ -2098,7 +2164,7 @@ _OLD_KEY_RE = re.compile(r'^(BM|AEM|RDN|SDN|SVN)-[a-fA-F0-9]{32}$')
 )
 def retire_devices_for_migration(
     payload: MigrationRequest,
-    token: str = Depends(verify_bearer_token_general),
+    token: str = Depends(verify_device_or_shared_token),
 ) -> GenericOk:
     """Mark old miner keys as migrated-to-FEM.
 
@@ -2199,7 +2265,7 @@ def acquire_installation_lease(
     miner_key: str,
     install_id: str,
     action: LeaseAction = Body(default_factory=LeaseAction),
-    token: str = Depends(verify_bearer_token_leases)
+    token: str = Depends(verify_device_or_lease_token)
 ) -> LeaseResponse:
     granted, record = STORE.acquire_lease(miner_key, install_id, action.lease_seconds, external_ip=action.external_ip)
     # Use the returned LeaseRecord (if provided) to avoid an extra status DB call.
@@ -2242,7 +2308,7 @@ def renew_installation_lease(
     miner_key: str,
     install_id: str,
     action: LeaseAction = Body(default_factory=LeaseAction),
-    token: str = Depends(verify_bearer_token_leases)
+    token: str = Depends(verify_device_or_lease_token)
 ) -> LeaseResponse:
     granted, record = STORE.renew_lease(miner_key, install_id, action.lease_seconds, external_ip=action.external_ip)
     # Use returned LeaseRecord to avoid an extra status call when possible
@@ -2278,7 +2344,7 @@ def renew_installation_lease(
 )
 def lease_status(
     miner_key: str,
-    token: str = Depends(verify_bearer_token_leases)
+    token: str = Depends(verify_device_or_lease_token)
 ) -> LeaseResponse:
     status_payload = STORE.lease_status(miner_key)
     # Expose False if no active lease.
@@ -2293,12 +2359,101 @@ def lease_status(
 )
 def get_hardware_doc(
     miner_key: str,
-    token: str = Depends(verify_bearer_token_general)
+    token: str = Depends(verify_device_or_shared_token)
 ) -> HardwareResponse:
     doc = STORE.get_hardware_doc(miner_key)
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No hardware document")
     return HardwareResponse(document=doc)
+
+
+
+_fem_logger = logging.getLogger("hardwareapi.fem_transform")
+
+
+def _accumulate_fem_reward_slot(store, miner_key: str, document: dict) -> None:
+    """Accumulate FEM slot into nested rewards structure for dbrewards compatibility.
+
+    FEM devices submit one slot per PUT with a slot_number field (0-143).
+    dbrewards expects rewards.{date}.{hour}.slots[] with per-slot gates nested
+    under a 'gates' key.  This function reads the current hour data to preserve
+    previously accumulated slots, inserts the new slot at the correct position,
+    and writes back via a targeted $set so other dates/hours are untouched.
+    """
+    try:
+        if not miner_key.startswith("FEM-"):
+            return
+
+        slots = document.get("slots", [])
+        if not slots or not isinstance(slots, list):
+            return
+
+        slot_data = slots[0]
+        if not isinstance(slot_data, dict):
+            return
+
+        slot_number = slot_data.get("slot_number")
+        if slot_number is None or not isinstance(slot_number, (int, float)):
+            return
+
+        slot_number = int(slot_number)
+        if slot_number < 0 or slot_number >= 144:
+            return
+
+        hour = str(slot_number // 6)
+        position = slot_number % 6
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Build BM-compatible slot object with nested gates
+        nested_slot = {
+            "gates": {
+                "data": slot_data.get("data", False),
+                "online": slot_data.get("online", False),
+                "mac_match": slot_data.get("mac_match", False),
+                "pol": slot_data.get("pol", False),
+                "poi": slot_data.get("poi", False),
+                "poa": slot_data.get("poa", False),
+            },
+            "tools_active": slot_data.get("tools_active", []),
+            "tools_count": slot_data.get("tools_count", 0),
+            "multiplier": slot_data.get("multiplier", 0),
+        }
+
+        # Read existing hour data to preserve other slots in same hour
+        collection = store._hardware_docs
+        existing = collection.find_one(
+            {"miner_key": miner_key},
+            {f"rewards.{date_str}.{hour}": 1}
+        )
+
+        # Build or update hour slots array (6 slots per hour)
+        hour_slots = [None] * 6
+        if existing:
+            existing_rewards = existing.get("rewards") or {}
+            existing_day = existing_rewards.get(date_str) or {}
+            existing_hour = existing_day.get(hour) or {}
+            existing_slots = existing_hour.get("slots") or []
+            for idx, s in enumerate(existing_slots):
+                if idx < 6:
+                    hour_slots[idx] = s
+
+        hour_slots[position] = nested_slot
+
+        # Targeted $set preserves other dates and hours
+        collection.update_one(
+            {"miner_key": miner_key},
+            {"$set": {f"rewards.{date_str}.{hour}": {"slots": hour_slots}}}
+        )
+
+        _fem_logger.info(
+            "FEM nested reward: %s slot %d -> rewards.%s.%s[%d]",
+            miner_key, slot_number, date_str, hour, position,
+        )
+
+    except Exception as e:
+        _fem_logger.warning(
+            "FEM nested reward transform failed for %s: %s", miner_key, e
+        )
 
 
 @app.put(
@@ -2320,6 +2475,7 @@ def put_hardware_doc(
     if should_write:
         document["reward_eligible"] = is_eligible
     STORE.put_hardware_doc(miner_key, document)
+    _accumulate_fem_reward_slot(STORE, miner_key, document)
     return GenericOk()
 
 

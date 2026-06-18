@@ -204,6 +204,10 @@ class VersionResponse(BaseModel):
         default=None,
         description="Per-tool multiplier for BM rewards.",
     )
+    base_reward: Optional[float] = Field(
+        default=None,
+        description="Base reward amount for the miner type.",
+    )
     limit: Optional[Union[int, str]] = Field(
         default=None,
         description="Installation limit per IP. Numeric (1, 2, 5, 10, etc.) for specific limits, or 'no' for unlimited.",
@@ -250,6 +254,7 @@ class MinerCode(str, Enum):
     SVN = "SVN"
     AEM = "AEM"
     IRM = "IRM"
+    FEM = "FEM"
 
 
 class MinerCodeOrAll(str, Enum):
@@ -265,6 +270,7 @@ class MinerCodeOrAll(str, Enum):
     SVN = "SVN"
     AEM = "AEM"
     IRM = "IRM"
+    FEM = "FEM"
 
 
 
@@ -395,9 +401,14 @@ class GenericOk(BaseModel):
 class ExistsResponse(BaseModel):
     """Response indicating whether a miner_key exists in creds.hardware."""
     exists: bool = Field(..., description="True if the miner_key exists in creds.hardware, False otherwise")
-    
+
     class Config:
         pass
+
+
+class RegistrationResponse(BaseModel):
+    status: str
+    device_token: Optional[str] = None
 
 
 class RewardsParamsRequest(BaseModel):
@@ -506,6 +517,13 @@ class PresearchPayload(BaseModel):
     timestamp: str = Field(..., description="ISO8601 UTC timestamp")
     nodes: List[PresearchNode] = Field(..., description="List of Presearch nodes")
 
+
+
+
+class MigrationRequest(BaseModel):
+    """Payload for POST /devices/migrate -- deactivate old keys on FEM migration."""
+    fem_key: str = Field(..., description='New FEM miner key (must match ^FEM-[a-fA-F0-9]{32}$)')
+    old_keys: List[str] = Field(..., description='Old miner keys to deactivate (max 20)')
 
 # Attach example for ExistsResponse
 if _pyd_major >= 2:

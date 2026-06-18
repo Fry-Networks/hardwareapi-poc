@@ -31,6 +31,22 @@ resolve_op_ref API_BEARER_TOKEN
 resolve_op_ref API_BEARER_TOKEN_FLXTIME
 resolve_op_ref API_BEARER_TOKEN_ADMIN
 resolve_op_ref API_BEARER_TOKEN_DROPWIRELESS
+resolve_op_ref DIIISCO_ENCRYPTION_KEY
+
+# Optional: resolve MYST_REG_TOKEN (non-fatal if vault item missing)
+_myst_val="${MYST_REG_TOKEN:-}"
+case "$_myst_val" in
+  op://*)
+    _resolved="$(op read "$_myst_val" 2>/dev/null)" || {
+      echo "Warning: MYST_REG_TOKEN not found in 1Password (will skip mystnodes provisioning)" >&2
+      unset MYST_REG_TOKEN
+      _resolved=""
+    }
+    if [ -n "$_resolved" ]; then
+      export MYST_REG_TOKEN="$_resolved"
+    fi
+    ;;
+esac
 
 # Done with 1Password — clear the service account token from the environment
 unset OP_SERVICE_ACCOUNT_TOKEN

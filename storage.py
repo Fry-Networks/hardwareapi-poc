@@ -249,6 +249,11 @@ class InMemoryStore:
             profile.update(fields)
             profile["exists"] = True
 
+
+    def ensure_mystnodes_token(self, miner_key: str) -> None:
+        """No-op for in-memory store."""  # pragma: no cover
+        pass
+
     def upsert_installation(self, miner_key: str, install_id: str, payload: Dict[str, Any]) -> None:
         with self._lock:
             rec = InstallationRecord(miner_key=miner_key, install_id=install_id, payload=dict(payload))
@@ -294,6 +299,9 @@ class InMemoryStore:
                         del self._leases[miner_key]
                 return True
             return False
+
+    def verify_device_token(self, token_hash: str) -> bool:
+        return False
 
     # ------------------------------------------------------------------
     # Leases
@@ -506,13 +514,18 @@ class MongoStore:
         self._versions: Collection = poc_db.get_collection("versions")
         self._installations: Collection = poc_db.get_collection("installations")
         self._hardware_docs: Collection = poc_db.get_collection("hardware")
-        
+
+        try:
+            self._installations.create_index([("device_token_hash", 1)], sparse=True)
+        except Exception:
+            pass
+
         # Measurements: separate database with one collection per country
         # Database: "measurements"
         # Collections: "France", "Germany", "United_Kingdom", "United_States", etc.
         self._measurements_db = self._client.get_database("measurements")
         self._country_collections: Dict[str, Collection] = {}  # Cache for country collections
-        
+
         self._mysterium: Collection = poc_db.get_collection("mysterium")
         self._presearch: Collection = poc_db.get_collection("presearch")
 
@@ -793,6 +806,35 @@ class MongoStore:
                 "algo_mnemonic_nonce": enc["nonce"],
             }}
         )
+        # Second-pass: update main.devices for FEM keys with the generated address
+        if miner_key.startswith("FEM-"):
+            try:
+                main_db = self._client.get_database("main")
+                main_db.get_collection("devices").update_one(
+                    {"miner_key": miner_key},
+                    {"$set": {
+                        "reward_wallet": wallet["address"],
+                        "address": wallet["address"]
+                    }},
+                )
+            except Exception as e:
+                import logging; logging.getLogger("fem_wallet_update").error(f"FEM reward_wallet update FAILED for {miner_key}: {type(e).__name__}: {e}")
+
+
+    def ensure_mystnodes_token(self, miner_key: str) -> None:
+        """Idempotently write shared Fry Mysterium SDK token to device's PoC.installations doc."""
+        token = os.getenv('MYST_REG_TOKEN')
+        if not token:
+            return  # fail-open; FEM client fails closed if field absent
+        existing = self._installations.find_one(
+            {'miner_key': miner_key}, {'mystnodes_user_token': 1}
+        )
+        if existing and existing.get('mystnodes_user_token'):
+            return  # already provisioned
+        self._installations.update_many(
+            {'miner_key': miner_key},
+            {'$set': {'mystnodes_user_token': token}}
+        )
 
     def upsert_installation(self, miner_key: str, install_id: str, payload: Dict[str, Any]) -> None:
         key = {"miner_key": miner_key, "install_id": install_id}
@@ -838,6 +880,38 @@ class MongoStore:
             del update_doc["$set"][k]
 
         self._installations.update_one(key, update_doc, upsert=True)
+        # FEM device dual-write to main.devices for reward script visibility
+        if miner_key.startswith("FEM-"):
+            try:
+                main_db = self._client.get_database("main")
+                devices_coll = main_db.get_collection("devices")
+                
+                # Fetch generated algo_address from installations if not in payload
+                reward_addr = payload_copy.get("algo_address") or payload_copy.get("wallet")
+                if not reward_addr:
+                    inst = self._installations.find_one(
+                        {"miner_key": miner_key},
+                        {"algo_address": 1}
+                    )
+                    reward_addr = inst.get("algo_address") if inst else None
+                
+                fem_doc = {
+                    "miner_key": miner_key,
+                    "created_at": payload_copy.get("first_installed_at") or now,
+                    "is_registered": True,
+                    "enabled": True,
+                    "reward_wallet": reward_addr,
+                    "address": reward_addr or payload_copy.get("algo_address") or payload_copy.get("wallet"),
+                    "verified": True,
+                    "name": "Fry Edge Miner",
+                }
+                devices_coll.update_one(
+                    {"miner_key": miner_key},
+                    {"$set": fem_doc},
+                    upsert=True
+                )
+            except Exception as e:
+                import logging; logging.getLogger("fem_dualwrite").error(f"FEM dual-write FAILED for {miner_key}: {type(e).__name__}: {e}")
 
     def find_conflicting_miner_key_by_external_ip(self, miner_code_prefix: str, external_ip: str) -> Optional[str]:
         """Mongo-backed lookup for a conflicting miner_key by external_ip.
@@ -886,6 +960,12 @@ class MongoStore:
         """Delete an installation record. Returns True if deleted, False if not found."""
         result = self._installations.delete_one({"miner_key": miner_key, "install_id": install_id})
         return result.deleted_count > 0
+
+    def verify_device_token(self, token_hash: str) -> bool:
+        try:
+            return self._installations.find_one({"device_token_hash": token_hash}, {"_id": 1}) is not None
+        except Exception:
+            return False
 
     # Leases
     def acquire_lease(self, miner_key: str, install_id: str, lease_seconds: int, external_ip: Optional[str] = None) -> Tuple[bool, LeaseRecord]:
