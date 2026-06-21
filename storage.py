@@ -69,6 +69,8 @@ class InMemoryStore:
         self._measurements: Dict[str, Dict[str, Any]] = {}  # keyed by hex_id
         self._mysterium: Dict[str, Dict[str, Any]] = {}
         self._presearch: Dict[str, Dict[str, Any]] = {}
+        self._products: Dict[str, Dict[str, Any]] = {}
+        self._tokens: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Version metadata
@@ -367,19 +369,33 @@ class InMemoryStore:
 
     # ------------------------------------------------------------------
     # Presearch
+    @staticmethod
+    def _node_name_from_miner_key(miner_key: str) -> str:
+        key = (miner_key or "").lower()
+        return key[-8:] if len(key) >= 8 else key
+
     def put_presearch(self, ip: str, document: Dict[str, Any]) -> None:
         with self._lock:
+            doc = dict(document)
+            for node in doc.get("nodes", []):
+                if not node.get("node_name"):
+                    node["node_name"] = self._node_name_from_miner_key(node.get("miner_key", ""))
             existing = self._presearch.get(ip)
-            if existing and "nodes" in existing and "nodes" in document:
-                # Index existing nodes by node_key for fast lookup
+            if existing and "nodes" in existing and "nodes" in doc:
                 merged = {n["node_key"]: n for n in existing["nodes"]}
-                for node in document["nodes"]:
+                for node in doc["nodes"]:
                     merged[node["node_key"]] = node
-                doc = dict(document)
                 doc["nodes"] = list(merged.values())
-                self._presearch[ip] = doc
-            else:
-                self._presearch[ip] = dict(document)
+            self._presearch[ip] = doc
+
+    def get_product(self, key: str, device_type: str = None) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return dict(self._products.get(key.upper())) if self._products.get(key.upper()) else None
+
+    def get_token_name(self, asset_id: str) -> Optional[str]:
+        with self._lock:
+            token = self._tokens.get(asset_id)
+            return token.get("name") if token else None
 
     # ------------------------------------------------------------------
     # Measurements
@@ -542,6 +558,8 @@ class MongoStore:
         # Fallback: main database devices (admin panel records)
         main_db = self._client.get_database("main")
         self._main_devices: Collection = main_db.get_collection("devices")
+        self._products: Collection = main_db.get_collection("products")
+        self._tokens: Collection = main_db.get_collection("tokens")
 
         self._merkle_trees: Collection = poc_db.get_collection("merkle_trees")
 
@@ -837,7 +855,7 @@ class MongoStore:
         )
 
     def upsert_installation(self, miner_key: str, install_id: str, payload: Dict[str, Any]) -> None:
-        key = {"miner_key": miner_key, "install_id": install_id}
+        key = {"miner_key": miner_key}
         payload_copy = dict(payload)
         now = datetime.now(timezone.utc)
         # Map incoming fields to your existing installation document shape
@@ -902,7 +920,7 @@ class MongoStore:
                     "enabled": True,
                     "reward_wallet": reward_addr,
                     "address": reward_addr or payload_copy.get("algo_address") or payload_copy.get("wallet"),
-                    "verified": True,
+                    "verified": False,
                     "name": "Fry Edge Miner",
                 }
                 devices_coll.update_one(
@@ -1209,8 +1227,16 @@ class MongoStore:
         return self._versions.find_one({"miner_code": miner_code})
 
     # Presearch
+    @staticmethod
+    def _node_name_from_miner_key(miner_key: str) -> str:
+        key = (miner_key or "").lower()
+        return key[-8:] if len(key) >= 8 else key
+
     def put_presearch(self, ip: str, document: Dict[str, Any]) -> None:
         incoming_nodes = document.get("nodes", [])
+        for node in incoming_nodes:
+            if not node.get("node_name"):
+                node["node_name"] = self._node_name_from_miner_key(node.get("miner_key", ""))
         # Use $set for top-level fields, then merge nodes by node_key
         top_level = {k: v for k, v in document.items() if k != "nodes"}
         top_level["ip"] = ip
@@ -1225,6 +1251,24 @@ class MongoStore:
             top_level["nodes"] = incoming_nodes
 
         self._presearch.update_one({"ip": ip}, {"$set": top_level}, upsert=True)
+
+    def get_product(self, key: str, device_type: str = None) -> Optional[Dict[str, Any]]:
+        query = {"key": key}
+        if device_type:
+            query["type"] = device_type
+        doc = self._products.find_one(query, sort=[("created_at", -1)])
+        if not doc:
+            return None
+        doc = dict(doc)
+        doc.pop("_id", None)
+        return doc
+
+    def get_token_name(self, asset_id: str) -> Optional[str]:
+        try:
+            doc = self._tokens.find_one({"asset_id": asset_id})
+            return doc.get("name") if doc else None
+        except Exception:
+            return None
 
     # Measurements
     def upload_measurement(self, hex_id: str, miner_code: str, install_id: str, timestamp: str, measurement_type: str, value: Dict[str, Any]) -> None:

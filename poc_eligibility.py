@@ -5,7 +5,7 @@ Server-computes a boolean `reward_eligible` flag on PUT /PoC/{miner_key}/hardwar
 dbrewards (ARES00) reads this flag as a strict `=== false` short-circuit for INSTALLER devices.
 
 Design:
-- INSTALLER allowlist: MinerCode enum (BM, IDM, ODM, ISM, OSM, RDN, AEM).
+- INSTALLER allowlist: MinerCode enum (FEM).
 - NON_INSTALLER (prefix not in enum): skip-write entirely (no field added).
 - INSTALLER eligibility requires ALL three gates to pass:
     (1) poc_uptodate : document["software"]["poc_version_installed"] == PoC.versions[miner_code].poc_version_needed
@@ -85,7 +85,7 @@ def compute_reward_eligible(document, miner_key, get_version_for_miner_code):
         return (True, False)
     if not version_doc:
         return (True, False)
-    # Required poc_version: try OS-nested first (BM/AEM windows shape per recon),
+    # Required poc_version: try OS-nested first (FEM windows shape per recon),
     # then top-level (for miner types whose versions docs are flat, e.g. RDN/SDN/SVN).
     required = None
     software_in = document.get("software") if isinstance(document, dict) else None

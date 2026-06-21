@@ -101,6 +101,7 @@ from models import (
     MysteriumKeystoreResponse,
     MigrationRequest,
     PresearchPayload,
+    ProductRewardResponse,
     RewardsParamsRequest,
     RewardsParamsResponse,
     VerifiedStatusResponse,
@@ -655,8 +656,8 @@ async def lifespan(app: FastAPI):
             "RDN": "Reward Decentralization Node",
             "SDN": "Storage Decentralization Node",
             "SVN": "Storage Validator Node",
-            "AEM": "AI Edge Miner",
             "IRM": "Indoor Radiation Miner",
+            "FEM": "Fry Edge Miner",
         }
 
         # Generate and cache the OpenAPI schema once. Avoid injecting
@@ -1826,9 +1827,15 @@ def get_required_version(
             filtered[normalized_platform] = platform_section
         else:
             filtered["detail"] = f"No version data for platform '{normalized_platform}'"
-        # Pass base_reward through platform filter
+        # Pass base_reward and reward fields through platform filter
         if 'base_reward' in version_data:
             filtered['base_reward'] = version_data['base_reward']
+        if 'reward_amount' in version_data:
+            filtered['reward_amount'] = version_data['reward_amount']
+        if 'reward_token_asa_id' in version_data:
+            filtered['reward_token_asa_id'] = version_data['reward_token_asa_id']
+        if 'reward_token_name' in version_data:
+            filtered['reward_token_name'] = version_data['reward_token_name']
         return VersionResponse(**filtered)
 
     return VersionResponse(**version_data)
@@ -1857,6 +1864,37 @@ def list_supported_installers(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
     return InstallerSupportResponse(os=normalized, miner_codes=miner_codes)
+
+
+@app.get(
+    "/products/{key}",
+    response_model=ProductRewardResponse,
+    response_model_exclude_none=True,
+    summary="Get product reward token configuration",
+    tags=["Products"],
+)
+def get_product_reward(
+    key: str = Path(..., description="Product key (e.g., FEM)"),
+    device_type: Optional[str] = Query(None, alias="type", description="Optional device type filter (e.g., hardware, mac, apikey)"),
+    token: str = Depends(verify_device_or_shared_token)
+) -> ProductRewardResponse:
+    product = STORE.get_product(key, device_type=device_type)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Product {key} not found")
+
+    reward = product.get("reward") or {}
+    tokens = reward.get("tokens") or {}
+    reward_asa = tokens.get("reward")
+    stake_asa = tokens.get("stake")
+
+    return ProductRewardResponse(
+        key=key,
+        reward_amount=tokens.get("reward_amount"),
+        reward_token_asa_id=str(reward_asa) if reward_asa is not None else None,
+        reward_token_name=STORE.get_token_name(str(reward_asa)) if reward_asa is not None else None,
+        stake_token_asa_id=str(stake_asa) if stake_asa is not None else None,
+        stake_token_name=STORE.get_token_name(str(stake_asa)) if stake_asa is not None else None,
+    )
 
 
 @app.put(
@@ -2045,7 +2083,7 @@ def upsert_installation(
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-    payload = heartbeat.model_dump()
+    payload = heartbeat.model_dump(mode="json")
     payload.setdefault("last_seen_at", utc_now().isoformat())
 
     device_token: Optional[str] = None
@@ -2152,7 +2190,7 @@ def delete_installation(
 
 # --- FEM Migration: old-key deactivation ---
 _FEM_KEY_RE = re.compile(r'^FEM-[a-fA-F0-9]{32}$')
-_OLD_KEY_RE = re.compile(r'^(BM|AEM|RDN|SDN|SVN)-[a-fA-F0-9]{32}$')
+_OLD_KEY_RE = re.compile(r'^(BM|AEM|FEM|RDN|SDN|SVN)-[a-fA-F0-9]{32}$')
 
 
 @app.post(
@@ -2186,7 +2224,7 @@ def retire_devices_for_migration(
         if not _OLD_KEY_RE.match(old_key):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"old_key must match (BM|AEM|RDN|SDN|SVN)-[a-fA-F0-9]{{32}}: {old_key!r}",
+                detail=f"old_key must match (BM|AEM|FEM|RDN|SDN|SVN)-[a-fA-F0-9]{{32}}: {old_key!r}",
             )
     # Deactivate
     for old_key in payload.old_keys:

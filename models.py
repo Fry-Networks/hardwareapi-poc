@@ -45,7 +45,7 @@ _VERSION_RESPONSE_EXAMPLE = {
 
 _INSTALLER_SUPPORT_EXAMPLE = {
     "os": "windows",
-    "miner_codes": ["BM", "AEM"]
+    "miner_codes": ["FEM"]
 }
 
 
@@ -53,7 +53,7 @@ _INSTALLER_SUPPORT_EXAMPLE = {
 _MINER_PROFILE_EXAMPLE = {
     "miner_key": "miner-key-abc",
     "address": "1abcd...",
-    "miner_type": "AEM",
+    "miner_type": "FEM",
     "credentials": {"mac_address": "AA:BB:CC:DD:EE:FF"},
     "credentials_saved_at": "2025-10-21T06:00:00Z",
     "position": {"lat": 35.0, "lng": -120.0, "hexId": "abc123"},
@@ -70,7 +70,7 @@ _VERIFIED_STATUS_EXAMPLE = {
 _INSTALLATION_HEARTBEAT_EXAMPLE = {
     "miner_key": "miner-key-abc",
     "install_id": "550e8400-e29b-41d4-a716-446655440000",
-    "minerCode": "AEM",
+    "minerCode": "FEM",
     "software_version_installed": "5.5.7",
     "poc_version_installed": "1.0.0",
     "hostname": "miner-01",
@@ -212,6 +212,23 @@ class VersionResponse(BaseModel):
         default=None,
         description="Installation limit per IP. Numeric (1, 2, 5, 10, etc.) for specific limits, or 'no' for unlimited.",
     )
+    reward_amount: Optional[float] = Field(
+        default=None,
+        description="Reward amount for the miner type.",
+    )
+    reward_token_asa_id: Optional[str] = Field(
+        default=None,
+        description="ASA ID of the reward token.",
+    )
+    reward_token_name: Optional[str] = Field(
+        default=None,
+        description="Name of the reward token.",
+    )
+    stake_tiers: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Stake tier configuration with multiplier and label per tier.",
+    )
+
 
     class Config:
         pass
@@ -252,7 +269,6 @@ class MinerCode(str, Enum):
     RDN = "RDN"
     SDN = "SDN"
     SVN = "SVN"
-    AEM = "AEM"
     IRM = "IRM"
     FEM = "FEM"
 
@@ -268,7 +284,6 @@ class MinerCodeOrAll(str, Enum):
     RDN = "RDN"
     SDN = "SDN"
     SVN = "SVN"
-    AEM = "AEM"
     IRM = "IRM"
     FEM = "FEM"
 
@@ -294,6 +309,7 @@ class VerifiedStatusResponse(BaseModel):
     """Response for the verified status endpoint."""
     miner_key: str = Field(..., description="Full miner key")
     verified: bool = Field(default=False, description="Whether the miner has been verified")
+    staked: Optional[Dict[str, Any]] = Field(default=None, description="Staking details if device has an active verification stake.")
 
     class Config:
         pass
@@ -471,6 +487,19 @@ class UpdateVersionRequest(BaseModel):
         default=None,
         description="Installation limit per IP. Numeric (1, 2, 5, 10, etc.) for specific limits, or 'no' for unlimited.",
     )
+    reward_amount: Optional[float] = Field(
+        default=None,
+        description="Reward amount for the miner type.",
+    )
+    reward_token_asa_id: Optional[str] = Field(
+        default=None,
+        description="ASA ID of the reward token.",
+    )
+    reward_token_name: Optional[str] = Field(
+        default=None,
+        description="Name of the reward token.",
+    )
+
 
     class Config:
         pass
@@ -510,6 +539,19 @@ class PresearchNode(BaseModel):
     connected: bool = Field(..., description="Whether the node is connected")
     blocked: bool = Field(..., description="Whether the node is blocked")
     description: Optional[str] = Field(None, description="Node description from meta")
+    node_name: Optional[str] = Field(None, description="Truncated miner-key suffix used as container/node label")
+
+
+class ProductRewardResponse(BaseModel):
+    key: str = Field(..., description="Product/miner code key (e.g., FEM)")
+    reward_amount: Optional[float] = Field(None, description="Token-denominated daily base reward amount")
+    reward_token_asa_id: Optional[str] = Field(None, description="ASA ID of the reward token")
+    reward_token_name: Optional[str] = Field(None, description="Display name of the reward token")
+    stake_token_asa_id: Optional[str] = Field(None, description="ASA ID of the stake token")
+    stake_token_name: Optional[str] = Field(None, description="Display name of the stake token")
+
+    class Config:
+        pass
 
 
 class PresearchPayload(BaseModel):
