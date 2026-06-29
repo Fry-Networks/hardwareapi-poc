@@ -13,6 +13,10 @@ import re
 import ipaddress
 
 # Try to load .env automatically when possible (non-fatal)
+
+# FRY 3.0 Configuration
+FRY3_ASA_ID = "3612979527"
+
 dotenv_spec = importlib.util.find_spec("dotenv")
 if dotenv_spec is not None:
     try:
@@ -477,6 +481,32 @@ def verify_device_or_shared_token(
     shared = os.environ.get("API_BEARER_TOKEN", "")
     if shared and token == shared:
         return token
+    fem_token = os.environ.get("FEM_API_TOKEN", "")
+    if fem_token and token == fem_token:
+        return token
+    legacy = os.environ.get("API_BEARER_TOKEN_LEGACY", "")
+    if legacy and token == legacy:
+        return token
+    if token.startswith("fem_") and len(token) == 68:
+        if STORE.verify_device_token(hash_device_token(token)):
+            return token
+    raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def verify_device_or_shared_token_no_fem(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> str:
+    """Like verify_device_or_shared_token but rejects FEM bootstrap token.
+    Use for endpoints that devices access post-registration only."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing authorization")
+    token = credentials.credentials
+    shared = os.environ.get("API_BEARER_TOKEN", "")
+    if shared and token == shared:
+        return token
+    legacy = os.environ.get("API_BEARER_TOKEN_LEGACY", "")
+    if legacy and token == legacy:
+        return token
     if token.startswith("fem_") and len(token) == 68:
         if STORE.verify_device_token(hash_device_token(token)):
             return token
@@ -493,6 +523,9 @@ def verify_device_or_lease_token(
         shared = os.environ.get(env_key, "")
         if shared and token == shared:
             return token
+    fem_token = os.environ.get("FEM_API_TOKEN", "")
+    if fem_token and token == fem_token:
+        return token
     if token.startswith("fem_") and len(token) == 68:
         if STORE.verify_device_token(hash_device_token(token)):
             return token
@@ -1808,6 +1841,27 @@ def get_required_version(
                 raise ValueError("Invalid platform. Use 'windows', 'linux', 'test-windows', or 'test-linux'.")
 
         version_data = STORE.get_version_document(miner_code.value)
+
+        # A2: Override reward token from admin-authoritative main.products
+        # Matches dbrewards' ProductModel.find({}) -> first key match
+        _ASA_NAMES = {"2681521901": "tFRY", "2485202024": "fNODE", "2485314946": "FRY 2.0",
+        "3612979527": "FRY 3.0"
+    }
+        try:
+            _product_doc = STORE.get_product(miner_code.value)
+            if _product_doc and version_data:
+                _tokens = (_product_doc.get("reward") or {}).get("tokens") or {}
+                _admin_asa = _tokens.get("reward")
+                if _admin_asa:
+                    version_data["reward_token_asa_id"] = _admin_asa
+                    _name = _ASA_NAMES.get(_admin_asa)
+                    if not _name and hasattr(STORE, "get_token_name"):
+                        _name = STORE.get_token_name(_admin_asa)
+                    if not _name:
+                        _name = version_data.get("reward_token_name") or _admin_asa
+                    version_data["reward_token_name"] = _name
+        except Exception:
+            pass  # safe fallback: keep PoC.versions values
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except Exception:
@@ -1836,6 +1890,8 @@ def get_required_version(
             filtered['reward_token_asa_id'] = version_data['reward_token_asa_id']
         if 'reward_token_name' in version_data:
             filtered['reward_token_name'] = version_data['reward_token_name']
+        if 'stake_tiers' in version_data:
+            filtered['stake_tiers'] = version_data['stake_tiers']
         return VersionResponse(**filtered)
 
     return VersionResponse(**version_data)
@@ -1866,6 +1922,19 @@ def list_supported_installers(
     return InstallerSupportResponse(os=normalized, miner_codes=miner_codes)
 
 
+def get_reward_token_for_mode(product_key: str, reward_mode: Optional[str] = None) -> Optional[str]:
+    """
+    Determine the reward ASA ID based on reward_mode.
+    FRY3: all miner_codes get FRY3_ASA_ID
+    FRY2: use product-specific token (from DB)
+    """
+    mode = reward_mode or "FRY2"
+    if mode == "FRY3":
+        return FRY3_ASA_ID
+    else:
+        return None
+
+
 @app.get(
     "/products/{key}",
     response_model=ProductRewardResponse,
@@ -1884,7 +1953,16 @@ def get_product_reward(
 
     reward = product.get("reward") or {}
     tokens = reward.get("tokens") or {}
-    reward_asa = tokens.get("reward")
+    # Read reward_mode per-request from main.configs (FRY2 default on failure)
+    try:
+        _mode_doc = STORE._client.get_database('main').get_collection('configs').find_one({'_id': 'reward_mode'})
+        _reward_mode = _mode_doc.get('mode', 'FRY2') if _mode_doc else 'FRY2'
+    except Exception:
+        _reward_mode = 'FRY2'
+    fry3_override = get_reward_token_for_mode(key, reward_mode=_reward_mode)
+    # REVERSAL: cp app.py.bak.1782251344 app.py && rebuild
+
+    reward_asa = fry3_override if fry3_override else tokens.get("reward")
     stake_asa = tokens.get("stake")
 
     return ProductRewardResponse(
@@ -2038,7 +2116,7 @@ def check_miner_exists(
 )
 def get_miner_verified_status(
     miner_key: str = Path(..., description="Full miner key"),
-    token: str = Depends(verify_device_or_shared_token)
+    token: str = Depends(verify_device_or_shared_token_no_fem)
 ) -> VerifiedStatusResponse:
     """Get the verification status of a miner.
 
@@ -2073,15 +2151,17 @@ def upsert_installation(
     if heartbeat.miner_key != miner_key or heartbeat.install_id != install_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Body miner identity mismatch")
 
-    is_fem = bool(re.match(r'^FEM-[a-fA-F0-9]{32}$', miner_key))
-    if not is_fem:
+    is_fem = bool(re.match(r'^FEM-[a-zA-Z0-9]{32}$', miner_key))
+    if is_fem:
+        expected = os.environ.get("FEM_API_TOKEN", "")
+    else:
         expected = os.environ.get("API_BEARER_TOKEN", "")
-        if not credentials or credentials.credentials != expected:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authentication token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    if not credentials or credentials.credentials != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     payload = heartbeat.model_dump(mode="json")
     payload.setdefault("last_seen_at", utc_now().isoformat())
@@ -2504,7 +2584,7 @@ def _accumulate_fem_reward_slot(store, miner_key: str, document: dict) -> None:
 def put_hardware_doc(
     miner_key: str,
     payload: HardwareDocument,
-    token: str = Depends(verify_bearer_token_general)
+    token: str = Depends(verify_device_or_shared_token)
 ) -> GenericOk:
     document = dict(payload.document)
     document.setdefault("miner_key", miner_key)

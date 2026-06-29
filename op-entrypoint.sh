@@ -31,6 +31,8 @@ resolve_op_ref API_BEARER_TOKEN
 resolve_op_ref API_BEARER_TOKEN_FLXTIME
 resolve_op_ref API_BEARER_TOKEN_ADMIN
 resolve_op_ref API_BEARER_TOKEN_DROPWIRELESS
+resolve_op_ref FEM_API_TOKEN
+resolve_op_ref API_BEARER_TOKEN_LEGACY
 resolve_op_ref DIIISCO_ENCRYPTION_KEY
 
 # Optional: resolve MYST_REG_TOKEN (non-fatal if vault item missing)
