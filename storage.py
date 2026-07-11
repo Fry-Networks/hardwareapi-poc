@@ -36,6 +36,24 @@ except Exception:  # pragma: no cover - optional dependency
 
     ReturnDocument = _RD  # type: ignore
 
+
+try:
+    from bson.objectid import ObjectId as _BsonObjectId
+except Exception:  # pragma: no cover - bson always ships with pymongo
+    _BsonObjectId = None
+
+
+def _stringify_objectids(obj):
+    """Recursively convert bson ObjectId instances to str so pydantic can serialize."""
+    if _BsonObjectId is not None and isinstance(obj, _BsonObjectId):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _stringify_objectids(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_stringify_objectids(v) for v in obj]
+    return obj
+
+
 @dataclass
 class InstallationRecord:
     miner_key: str
@@ -560,6 +578,8 @@ class MongoStore:
         self._main_devices: Collection = main_db.get_collection("devices")
         self._products: Collection = main_db.get_collection("products")
         self._tokens: Collection = main_db.get_collection("tokens")
+        self._device_rewards: Collection = main_db.get_collection("device-rewards")
+        self._poc_dailies: Collection = main_db.get_collection("poc_reward_dailies")
 
         self._merkle_trees: Collection = poc_db.get_collection("merkle_trees")
 
@@ -798,7 +818,7 @@ class MongoStore:
             except Exception:
                 pass
 
-        return doc
+        return _stringify_objectids(doc)
 
     def set_miner_profile(self, miner_key: str, **fields: Any) -> None:
         payload = dict(fields)
