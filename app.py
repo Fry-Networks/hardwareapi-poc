@@ -74,7 +74,9 @@ for k, v in list(os.environ.items()):
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from fastapi.openapi.utils import get_openapi
 from fastapi.openapi.docs import get_swagger_ui_html
@@ -738,13 +740,31 @@ async def lifespan(app: FastAPI):
             import json
             data = json.loads(bans_file.read_text(encoding="utf-8"))
             if isinstance(data, list):
+                import time as _time
+                _now = int(_time.time())
+                _kept = []
                 for entry in data:
-                    if isinstance(entry, dict):
-                        ip = entry.get("ip")
-                        if ip:
-                            _persistent_bans[ip] = entry
-                            _probe_blocklist[ip] = float("inf")
-                            logging.getLogger("ExternalAPI.file").warning(f"LOADED_PERSISTENT_BAN ip={ip} reason={entry.get('reason')}")
+                    if not isinstance(entry, dict):
+                        continue  # legacy bare-string entries: drop
+                    ip = entry.get("ip")
+                    if not ip:
+                        continue
+                    if "expires_at" not in entry:
+                        # Pre-TTL legacy entry: these were automated temp blocks
+                        # that must not survive restarts as permanent bans. Drop.
+                        logging.getLogger("ExternalAPI.file").warning(f"DROPPED_LEGACY_BAN ip={ip} reason={entry.get('reason')}")
+                        continue
+                    _exp = entry.get("expires_at")
+                    if _exp is not None and _exp <= _now:
+                        logging.getLogger("ExternalAPI.file").warning(f"EXPIRED_BAN_DROPPED ip={ip} reason={entry.get('reason')}")
+                        continue
+                    _kept.append(entry)
+                    _persistent_bans[ip] = entry
+                    _probe_blocklist[ip] = float(_exp) if _exp is not None else float("inf")
+                    logging.getLogger("ExternalAPI.file").warning(f"LOADED_PERSISTENT_BAN ip={ip} reason={entry.get('reason')} expires_at={_exp}")
+                if len(_kept) != len(data):
+                    # self-clean: rewrite file without dropped entries
+                    _atomic_write_json(bans_file, _kept)
     except Exception:
         logging.getLogger("ExternalAPI.file").debug("failed to load persistent bans")
 
@@ -854,6 +874,16 @@ app = FastAPI(
     openapi_url=None,  # Disable default openapi.json
 )
 
+
+# Add CORS middleware for public API access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
+)
+
 # Ensure real client IPs are used when behind a trusted proxy (e.g., nginx).
 # Configure trusted proxy IPs via TRUSTED_PROXY_IPS env var (comma-separated).
 _trusted_proxy_env = os.getenv("TRUSTED_PROXY_IPS", "127.0.0.1,::1").strip()
@@ -926,7 +956,7 @@ def _atomic_write_json(path: PathLib, data: object) -> None:
     os.replace(str(tmp), str(path))
 
 
-def _persist_add_ban(ip: str, reason: str = "") -> None:
+def _persist_add_ban(ip: str, reason: str = "", ttl_seconds: Optional[int] = None) -> None:
     """Add a persistent ban entry with metadata (idempotent).
 
     Stored format: [{"ip": "1.2.3.4", "reason": "sensitive_probe", "ts": 169...}, ...]
@@ -946,13 +976,23 @@ def _persist_add_ban(ip: str, reason: str = "") -> None:
         # Build a map for idempotency
         by_ip = {e.get("ip"): e for e in existing if isinstance(e, dict) and e.get("ip")}
         if ip not in by_ip:
-            entry = {"ip": ip, "reason": reason, "ts": int(time.time())}
+            entry = {
+                "ip": ip,
+                "reason": reason,
+                "ts": int(time.time()),
+                # None = permanent (manual bans); set for automated blocks so
+                # they cannot outlive their intended window across restarts.
+                "expires_at": (int(time.time()) + ttl_seconds) if ttl_seconds else None,
+            }
             existing.append(entry)
             _atomic_write_json(bans_file, existing)
             _persistent_bans[ip] = entry
-            logging.getLogger("ExternalAPI.file").warning(f"ADDED_PERSISTENT_BAN ip={ip} reason={reason}")
+            logging.getLogger("ExternalAPI.file").warning(f"ADDED_PERSISTENT_BAN ip={ip} reason={reason} expires_at={entry['expires_at']}")
         else:
-            # update in-memory map if missing
+            # repeat offender: refresh the expiry window
+            if ttl_seconds:
+                by_ip[ip]["expires_at"] = int(time.time()) + ttl_seconds
+                _atomic_write_json(bans_file, existing)
             _persistent_bans[ip] = by_ip[ip]
     except Exception:
         logging.getLogger("ExternalAPI.file").exception("failed to persist added ban for %s", ip)
@@ -1227,7 +1267,7 @@ async def log_requests(request: Request, call_next):
                                     if len(sc) >= _sensitive_threshold:
                                         # timed block (persisted)
                                         _probe_blocklist[client_ip] = now_ts + _probe_block_seconds
-                                        _persist_add_ban(client_ip, reason="sensitive_probe")
+                                        _persist_add_ban(client_ip, reason="sensitive_probe", ttl_seconds=86400)
                                         logging.getLogger("ExternalAPI.file").warning(f"FAILED_SENSITIVE_PROBE ip={client_ip} path={url_path} count={len(sc)}")
                                         logging.getLogger("ExternalAPI.console").warning(f"{client_ip} - [WARNING] - IP blocked {_probe_block_seconds}s due to sensitive probes")
                                         sc.clear()
@@ -1239,7 +1279,7 @@ async def log_requests(request: Request, call_next):
                         # Check consecutive 404 threshold
                         if c >= _probe_404_consec_threshold:
                             _probe_blocklist[client_ip] = now_ts + _probe_block_seconds
-                            _persist_add_ban(client_ip, reason="404_consecutive")
+                            _persist_add_ban(client_ip, reason="404_consecutive", ttl_seconds=_probe_block_seconds)
                             logging.getLogger("ExternalAPI.file").warning(f"FAILED_PROBE_CONSEC_404 ip={client_ip} count={c}")
                             logging.getLogger("ExternalAPI.console").warning(f"{client_ip} - [WARNING] - IP blocked {_probe_block_seconds}s due to {c} consecutive 404s")
                             _probe_404_consec[client_ip] = 0
@@ -1249,7 +1289,7 @@ async def log_requests(request: Request, call_next):
                         if len(dq) >= _probe_404_threshold:
                             # Timed block for repeated 404 probes (persisted)
                             _probe_blocklist[client_ip] = now_ts + _probe_block_seconds
-                            _persist_add_ban(client_ip, reason="404_threshold")
+                            _persist_add_ban(client_ip, reason="404_threshold", ttl_seconds=_probe_block_seconds)
                             # emit a fail2ban-friendly block marker as well (file-only)
                             logging.getLogger("ExternalAPI.file").warning(f"FAILED_PROBE_BLOCK ip={client_ip} reason=404s count={len(dq)}")
                             # user-visible console message (UA not included)
@@ -1458,6 +1498,97 @@ def health() -> Dict[str, Any]:
         "time": utc_now().isoformat(),
     }
 
+
+
+@app.get("/api/v1/public/stats", tags=["Public"], summary="Public network statistics")
+def public_stats() -> Dict[str, Any]:
+    """
+    Public statistics endpoint showing aggregated network data.
+    No authentication required. CORS enabled for browser access.
+    
+    Returns statistics about:
+    - Total miner count
+    - Active installations
+    - Network status
+    """
+    try:
+        # Query database for stats
+        total_miners = STORE._installations.count_documents({})
+        active_miners = STORE._installations.count_documents(
+            {"status": {"$in": ["active", "online", "syncing"]}}
+        )
+        
+        # Get hardware documents count
+        total_hardware = STORE._hardware_docs.count_documents({})
+        
+        # Get version information for distribution
+        version_stats = {}
+        versions = STORE._versions.find()
+        for version_doc in versions:
+            version_key = version_doc.get("version", "unknown")
+            version_stats[version_key] = version_doc.get("count", 0)
+        
+        # Rewards distributed - sum pre-computed totals
+        try:
+            reward_agg = list(STORE._device_rewards.aggregate([
+                {"$group": {"_id": None, "tc": {"$sum": "$total_claimed"}, "tcl": {"$sum": "$total_claimable"}}}
+            ]))
+            rewards_distributed = reward_agg[0]["tc"] + reward_agg[0]["tcl"] if reward_agg else 0
+        except Exception:
+            rewards_distributed = 0
+
+        # Connectivity checks - sum slots_valid
+        try:
+            poc_agg = list(STORE._poc_dailies.aggregate([
+                {"$group": {"_id": None, "tc": {"$sum": "$slots_valid"}}}
+            ]))
+            connectivity_checks = poc_agg[0]["tc"] if poc_agg else 0
+        except Exception:
+            connectivity_checks = 0
+
+        # Discord member count
+        try:
+            import urllib.request, urllib.error
+            discord_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+            if discord_token:
+                req = urllib.request.Request(
+                    "https://discord.com/api/v10/guilds/1004603899598082069?with_counts=true",
+                    headers={"Authorization": f"Bot {discord_token}", "User-Agent": "FryNetworksAPI/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    discord_data = __import__('json').loads(resp.read())
+                    discord_members = discord_data.get("approximate_member_count", 0)
+            else:
+                discord_members = 0
+        except Exception as e:
+            logging.warning(f"Discord API call failed: {e}")
+            discord_members = 0
+
+        return {
+            "timestamp": utc_now().isoformat(),
+            "network": {
+                "total_miners": total_miners,
+                "active_miners": active_miners,
+                "total_hardware": total_hardware,
+                "rewards_distributed": rewards_distributed,
+                "connectivity_checks": connectivity_checks,
+                "discord_members": discord_members,
+            },
+            "versions": version_stats,
+            "status": "healthy",
+        }
+    except Exception as e:
+        # Return minimal stats on error
+        return {
+            "timestamp": utc_now().isoformat(),
+            "error": str(e),
+            "status": "error",
+            "network": {
+                "total_miners": 0,
+                "active_miners": 0,
+                "total_hardware": 0,
+            },
+        }
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
@@ -2152,16 +2283,16 @@ def upsert_installation(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Body miner identity mismatch")
 
     is_fem = bool(re.match(r'^FEM-[a-zA-Z0-9]{32}$', miner_key))
-    if is_fem:
-        expected = os.environ.get("FEM_API_TOKEN", "")
-    else:
+    if not is_fem:
+        # Non-FEM keys require shared bearer token
         expected = os.environ.get("API_BEARER_TOKEN", "")
-    if not credentials or credentials.credentials != expected:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        if not credentials or credentials.credentials != expected:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    # FEM registrations are open — per-device tokens handle post-registration auth
 
     payload = heartbeat.model_dump(mode="json")
     payload.setdefault("last_seen_at", utc_now().isoformat())
@@ -2739,6 +2870,7 @@ if __name__ == "__main__":
         host=host, 
         port=port, 
         reload=reload_flag,
+        workers=4,
         log_config=None,  # Use existing logging configuration
         access_log=False,  # Disable uvicorn access logging - we handle it in middleware
         use_colors=False   # Disable uvicorn colors since we handle our own
