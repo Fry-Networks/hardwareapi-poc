@@ -851,8 +851,7 @@ class MongoStore:
                 main_db.get_collection("devices").update_one(
                     {"miner_key": miner_key},
                     {"$set": {
-                        "reward_wallet": wallet["address"],
-                        "address": wallet["address"]
+                        "device_algo_address": wallet["address"]
                     }},
                 )
             except Exception as e:
@@ -933,19 +932,20 @@ class MongoStore:
                     )
                     reward_addr = inst.get("algo_address") if inst else None
                 
-                fem_doc = {
+                # F2: create a PENDING device doc (is_registered:False) so the dashboard
+                # wallet-bind is not pre-empted; never clobber dashboard-owned fields
+                # (is_registered/address/reward_wallet/verified) on existing docs.
+                fem_doc_insert = {
                     "miner_key": miner_key,
                     "created_at": payload_copy.get("first_installed_at") or now,
-                    "is_registered": True,
+                    "is_registered": False,
                     "enabled": True,
-                    "reward_wallet": reward_addr,
-                    "address": reward_addr or payload_copy.get("algo_address") or payload_copy.get("wallet"),
                     "verified": False,
                     "name": "Fry Edge Miner",
                 }
                 devices_coll.update_one(
                     {"miner_key": miner_key},
-                    {"$set": fem_doc},
+                    {"$setOnInsert": fem_doc_insert, "$set": {"device_algo_address": reward_addr}},
                     upsert=True
                 )
             except Exception as e:
