@@ -22,6 +22,7 @@ services:
       API_BEARER_TOKEN_DROPWIRELESS: "${API_BEARER_TOKEN_DROPWIRELESS:-op://HardwareAPI/Secrets/API_BEARER_TOKEN_DROPWIRELESS}"
       API_BEARER_TOKEN_LEGACY: "${API_BEARER_TOKEN_LEGACY:-op://HardwareAPI/Secrets/API_BEARER_TOKEN_LEGACY}"
       FEM_API_TOKEN: "${FEM_API_TOKEN:-op://HardwareAPI/Secrets/FEM_API_TOKEN}"
+      DISCORD_BOT_TOKEN: "${DISCORD_BOT_TOKEN}"
       DIIISCO_ENCRYPTION_KEY: "${DIIISCO_ENCRYPTION_KEY:-op://HardwareAPI/Secrets/DIIISCO_ENCRYPTION_KEY}"
       MYST_REG_TOKEN: "${MYST_REG_TOKEN:-op://HardwareAPI/Secrets/MYST_REG_TOKEN}"
       # Probe detection thresholds (exempt paths handled in app.py)

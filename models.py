@@ -330,6 +330,7 @@ class InstallationHeartbeat(BaseModel):
     os: Optional[str] = Field(default=None, description="Operating system string reported by the miner")
     last_seen_at: Optional[datetime] = Field(default=None, description="ISO timestamp when heartbeat was sent")
     is_installed: Optional[bool] = Field(default=None, description="Whether the miner reports the software as installed")
+    device_name: Optional[str] = Field(default=None, description="Device display name (e.g., animal name from FEM client)")
     software_version_needed: Optional[str] = Field(default=None, description="Software version required (from versions endpoint)")
     poc_version_needed: Optional[str] = Field(default=None, description="PoC version required (from versions endpoint)")
     is_uptodate: Optional[bool] = Field(default=None, description="Whether the miner considers itself up-to-date")

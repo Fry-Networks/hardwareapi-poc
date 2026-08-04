@@ -2262,7 +2262,8 @@ def get_miner_verified_status(
         )
     return VerifiedStatusResponse(
         miner_key=miner_key,
-        verified=profile.get("verified", False)
+        verified=profile.get("verified", False),
+        staked=STORE.get_device_stake(miner_key)
     )
 
 
@@ -2296,6 +2297,9 @@ def upsert_installation(
 
     payload = heartbeat.model_dump(mode="json")
     payload.setdefault("last_seen_at", utc_now().isoformat())
+    # Only persist device_name when explicitly provided and non-empty
+    if not payload.get("device_name"):
+        payload.pop("device_name", None)
 
     device_token: Optional[str] = None
     if is_fem:

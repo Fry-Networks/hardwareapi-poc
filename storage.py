@@ -554,6 +554,17 @@ class MongoStore:
         except Exception:
             pass
 
+        try:
+            # One document per (miner_key, install_id) — installs of the same key must
+            # not overwrite each other's device token or lease.
+            self._installations.create_index(
+                [("miner_key", 1), ("install_id", 1)],
+                unique=True,
+                name="miner_key_1_install_id_1_unique",
+            )
+        except Exception:
+            pass
+
         # Measurements: separate database with one collection per country
         # Database: "measurements"
         # Collections: "France", "Germany", "United_Kingdom", "United_States", etc.
@@ -780,7 +791,9 @@ class MongoStore:
             
             if not doc:
                 # If not found, try installations collection
-                doc = self._installations.find_one({"miner_key": miner_key})
+                doc = self._installations.find_one(
+                    {"miner_key": miner_key}, sort=[("last_seen_at", -1)]
+                )
                 if doc:
                     doc = dict(doc)
                     doc.pop("_id", None)
@@ -820,6 +833,33 @@ class MongoStore:
 
         return _stringify_objectids(doc)
 
+    # Verification-stake tier keys must match PoC.versions stake_tiers.
+    _STAKE_TYPE_TO_TIER = {"one": "24h", "two": "6mo"}
+    # FRY 1.0 stakes are legacy and do not carry a verification multiplier.
+    _LEGACY_STAKE_ASSET_ID = "924268058"
+
+    def get_device_stake(self, miner_key: str) -> Optional[Dict[str, Any]]:
+        """Return the device's active verification stake as {type, amount}.
+
+        Reads main.devices (the dashboard-owned record). Returns None when the
+        device has no stake, an unknown lock type, or a legacy FRY 1.0 stake.
+        """
+        try:
+            doc = self._main_devices.find_one({"miner_key": miner_key}, {"staked": 1})
+        except Exception:
+            return None
+        staked = (doc or {}).get("staked") or {}
+        amount = staked.get("amount")
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            return None
+        asset_id = staked.get("asset_id")
+        if asset_id is not None and str(asset_id) == self._LEGACY_STAKE_ASSET_ID:
+            return None
+        tier = self._STAKE_TYPE_TO_TIER.get(str(staked.get("type") or "").lower())
+        if tier is None:
+            return None
+        return {"type": tier, "amount": float(amount)}
+
     def set_miner_profile(self, miner_key: str, **fields: Any) -> None:
         payload = dict(fields)
         payload.setdefault("exists", True)
@@ -830,9 +870,20 @@ class MongoStore:
     def ensure_algo_wallet(self, miner_key: str) -> None:
         """Idempotent: generate and store Algorand wallet for device if not already provisioned."""
         existing = self._installations.find_one(
-            {"miner_key": miner_key}, {"algo_address": 1}
+            {"miner_key": miner_key, "algo_address": {"$exists": True, "$ne": None}},
+            {"algo_address": 1, "algo_mnemonic_enc": 1, "algo_mnemonic_nonce": 1},
         )
         if existing and existing.get("algo_address"):
+            # One wallet per miner_key: copy it onto any install doc that lacks it
+            # rather than generating a second wallet for the same device.
+            self._installations.update_many(
+                {"miner_key": miner_key, "algo_address": {"$exists": False}},
+                {"$set": {
+                    "algo_address": existing.get("algo_address"),
+                    "algo_mnemonic_enc": existing.get("algo_mnemonic_enc"),
+                    "algo_mnemonic_nonce": existing.get("algo_mnemonic_nonce"),
+                }}
+            )
             return  # Already provisioned
         wallet = generate_device_wallet()
         enc = encrypt_mnemonic(wallet["mnemonic"])
@@ -863,18 +914,47 @@ class MongoStore:
         token = os.getenv('MYST_REG_TOKEN')
         if not token:
             return  # fail-open; FEM client fails closed if field absent
-        existing = self._installations.find_one(
-            {'miner_key': miner_key}, {'mystnodes_user_token': 1}
-        )
-        if existing and existing.get('mystnodes_user_token'):
-            return  # already provisioned
         self._installations.update_many(
-            {'miner_key': miner_key},
+            {'miner_key': miner_key, 'mystnodes_user_token': {'$exists': False}},
             {'$set': {'mystnodes_user_token': token}}
         )
 
+    def _ensure_fem_device_doc(self, miner_key: str) -> None:
+        """Idempotently create the pending main.devices doc for a FEM key so the
+        dashboard and reward script can see it. Called on registration AND lease
+        acquisition so a device that reaches the server via either path is never
+        left without a device doc. Never clobbers dashboard-owned fields
+        (is_registered/address/reward_wallet/verified) on existing docs."""
+        if not miner_key.startswith("FEM-"):
+            return
+        try:
+            now = datetime.now(timezone.utc)
+            devices_coll = self._client.get_database("main").get_collection("devices")
+            inst = self._installations.find_one(
+                {"miner_key": miner_key, "algo_address": {"$exists": True, "$ne": None}},
+                {"algo_address": 1},
+            )
+            reward_addr = inst.get("algo_address") if inst else None
+            fem_doc_insert = {
+                "miner_key": miner_key,
+                "created_at": now,
+                "is_registered": False,
+                "enabled": True,
+                "verified": False,
+                "name": "Fry Edge Miner",
+            }
+            dual_update: Dict[str, Any] = {"$setOnInsert": fem_doc_insert}
+            if reward_addr:
+                dual_update["$set"] = {"device_algo_address": reward_addr}
+            devices_coll.update_one({"miner_key": miner_key}, dual_update, upsert=True)
+        except Exception as e:
+            import logging
+            logging.getLogger("fem_dualwrite").error(
+                "FEM device-doc ensure FAILED for %s: %s: %s" % (miner_key, type(e).__name__, e)
+            )
+
     def upsert_installation(self, miner_key: str, install_id: str, payload: Dict[str, Any]) -> None:
-        key = {"miner_key": miner_key}
+        key = {"miner_key": miner_key, "install_id": install_id}
         payload_copy = dict(payload)
         now = datetime.now(timezone.utc)
         # Map incoming fields to your existing installation document shape
@@ -917,39 +997,7 @@ class MongoStore:
             del update_doc["$set"][k]
 
         self._installations.update_one(key, update_doc, upsert=True)
-        # FEM device dual-write to main.devices for reward script visibility
-        if miner_key.startswith("FEM-"):
-            try:
-                main_db = self._client.get_database("main")
-                devices_coll = main_db.get_collection("devices")
-                
-                # Fetch generated algo_address from installations if not in payload
-                reward_addr = payload_copy.get("algo_address") or payload_copy.get("wallet")
-                if not reward_addr:
-                    inst = self._installations.find_one(
-                        {"miner_key": miner_key},
-                        {"algo_address": 1}
-                    )
-                    reward_addr = inst.get("algo_address") if inst else None
-                
-                # F2: create a PENDING device doc (is_registered:False) so the dashboard
-                # wallet-bind is not pre-empted; never clobber dashboard-owned fields
-                # (is_registered/address/reward_wallet/verified) on existing docs.
-                fem_doc_insert = {
-                    "miner_key": miner_key,
-                    "created_at": payload_copy.get("first_installed_at") or now,
-                    "is_registered": False,
-                    "enabled": True,
-                    "verified": False,
-                    "name": "Fry Edge Miner",
-                }
-                devices_coll.update_one(
-                    {"miner_key": miner_key},
-                    {"$setOnInsert": fem_doc_insert, "$set": {"device_algo_address": reward_addr}},
-                    upsert=True
-                )
-            except Exception as e:
-                import logging; logging.getLogger("fem_dualwrite").error(f"FEM dual-write FAILED for {miner_key}: {type(e).__name__}: {e}")
+        self._ensure_fem_device_doc(miner_key)
 
     def find_conflicting_miner_key_by_external_ip(self, miner_code_prefix: str, external_ip: str) -> Optional[str]:
         """Mongo-backed lookup for a conflicting miner_key by external_ip.
@@ -1033,6 +1081,23 @@ class MongoStore:
                 )
                 return False, rec
 
+        # Key-wide lease exclusivity: with one document per (miner_key, install_id),
+        # a sibling install must not be granted a lease while another holds one.
+        holder = self._installations.find_one({
+            "miner_key": miner_key,
+            "lease_install_id": {"$ne": install_id},
+            "lease_expires_at": {"$gt": now},
+        })
+        if holder:
+            print(f"[MongoStore] acquire_lease: DENIED (key-wide lease held by {holder.get('lease_install_id')}) for {miner_key}/{install_id}")
+            return False, LeaseRecord(
+                miner_key=miner_key,
+                holder_install_id=holder.get("lease_install_id", "unknown"),
+                expires_at=holder.get("lease_expires_at", now),
+                last_seen_at=holder.get("last_seen_at", now),
+                external_ip=holder.get("external_ip"),
+            )
+
         # Prepare filter for the atomic operation
         # The $or condition ensures we only update when:
         # 1. This install_id already holds the lease (renew/extend), OR
@@ -1071,6 +1136,7 @@ class MongoStore:
 
             if updated:
                 print(f"[MongoStore] acquire_lease: atomic grant succeeded for {miner_key}/{install_id}")
+                self._ensure_fem_device_doc(miner_key)
 
                 expires_val = updated.get("lease_expires_at")
                 last_seen = updated.get("last_seen_at", now)
@@ -1114,11 +1180,28 @@ class MongoStore:
                 )
             except Exception:
                 pass
+            self._ensure_fem_device_doc(miner_key)
             return True, LeaseRecord(miner_key=miner_key, holder_install_id=install_id, expires_at=expiry, last_seen_at=now, external_ip=external_ip)
 
     def renew_lease(self, miner_key: str, install_id: str, lease_seconds: int, external_ip: Optional[str] = None) -> Tuple[bool, Optional[LeaseRecord]]:
         now = datetime.now(timezone.utc)
         new_expiry = now + timedelta(seconds=max(lease_seconds, 1))
+
+        # Key-wide lease exclusivity: refuse renewal while a sibling install holds the lease.
+        holder = self._installations.find_one({
+            "miner_key": miner_key,
+            "lease_install_id": {"$ne": install_id},
+            "lease_expires_at": {"$gt": now},
+        })
+        if holder:
+            print(f"[MongoStore] renew_lease: DENIED (key-wide lease held by {holder.get('lease_install_id')}) for {miner_key}/{install_id}")
+            return False, LeaseRecord(
+                miner_key=miner_key,
+                holder_install_id=holder.get("lease_install_id", "unknown"),
+                expires_at=holder.get("lease_expires_at", now),
+                last_seen_at=holder.get("last_seen_at", now),
+                external_ip=holder.get("external_ip"),
+            )
 
         # Atomic conditional renewal: only succeeds if this install_id currently holds the lease
         filter_q = {
