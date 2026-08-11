@@ -2724,6 +2724,24 @@ def put_hardware_doc(
     document = dict(payload.document)
     document.setdefault("miner_key", miner_key)
     document.setdefault("lastUpdated", utc_now().isoformat())
+    # FEM clients since ~2026-06-12 omit the software block from hardware PUTs, which
+    # fail-closed the version gate on every heartbeat. Judge the last known software
+    # block instead; devices with no known version stay fail-closed.
+    if not isinstance(document.get("software"), dict):
+        _stored_sw = (STORE.get_hardware_doc(miner_key) or {}).get("software")
+        if isinstance(_stored_sw, dict):
+            document["software"] = _stored_sw
+        else:
+            # Installation heartbeats still report versions; use the freshest one.
+            try:
+                _prof = STORE.get_miner_profile(miner_key) or {}
+            except Exception:
+                _prof = {}
+            if _prof.get("poc_version_installed"):
+                document["software"] = {
+                    "os": _prof.get("os") or "windows",
+                    "poc_version_installed": _prof.get("poc_version_installed"),
+                }
     should_write, is_eligible = compute_reward_eligible(document, miner_key, STORE.get_version_for_miner_code)
     if should_write:
         document["reward_eligible"] = is_eligible

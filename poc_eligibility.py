@@ -60,6 +60,32 @@ def extract_miner_code(miner_key):
     return miner_key[:3].upper()
 
 
+def _parse_version(raw):
+    """Split a dotted version into an int tuple. None when unparseable (fail-closed)."""
+    if raw is None:
+        return None
+    parts = str(raw).strip().split(".")
+    if not parts or len(parts) > 4:
+        return None
+    out = []
+    for p in parts:
+        if not p.isdigit():
+            return None
+        out.append(int(p))
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out[:4])
+
+
+def _version_at_least(installed, required):
+    """True when installed >= required. A client NEWER than the pin is eligible; the old
+    exact-equality check punished up-to-date miners and zeroed their rewards."""
+    iv = _parse_version(installed)
+    rv = _parse_version(required)
+    if iv is None or rv is None:
+        return False
+    return iv >= rv
+
 def compute_reward_eligible(document, miner_key, get_version_for_miner_code):
     """
     Returns (should_write: bool, eligible: bool).
@@ -105,7 +131,7 @@ def compute_reward_eligible(document, miner_key, get_version_for_miner_code):
     installed = software.get("poc_version_installed")
     if not installed:
         return (True, False)
-    if str(installed).strip() != str(required).strip():
+    if not _version_at_least(installed, required):
         return (True, False)
 
     # Liveness gate
