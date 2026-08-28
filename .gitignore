@@ -34,3 +34,23 @@ deployment/whitelist_ips.json
 # OS clutter
 .DS_Store
 Thumbs.db
+
+# open-source hygiene
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa
+id_ed25519
+.npmrc
+.netrc
+*.tfstate
+*.tfstate.*
+kubeconfig
+serviceAccount*.json
+secrets.json
+*.sqlite
+*.sqlite3
+*.db
