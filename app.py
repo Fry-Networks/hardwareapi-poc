@@ -124,6 +124,19 @@ def hash_device_token(token: str) -> str:
     return hashlib.sha256(token.encode('utf-8')).hexdigest()
 
 
+def _token_matches(provided: Optional[str], expected: Optional[str]) -> bool:
+    """Constant-time bearer-token comparison.
+
+    Plain ==/!= on secret tokens short-circuits at the first differing byte,
+    which leaks timing information an attacker can use to recover the token
+    character-by-character. Every comparison against an API_BEARER_TOKEN* or
+    FEM_API_TOKEN value in this file goes through here instead.
+    """
+    if not provided or not expected:
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
 # Configure logging with timestamps and file output
 def setup_logging():
     """Set up logging with both console and file output with timestamps."""
@@ -319,7 +332,7 @@ def verify_bearer_token_flxtime(request: Request, credentials: HTTPAuthorization
         )
     
     # Accept either the FlxTime-specific token OR the general token
-    if credentials.credentials != flxtime_token and credentials.credentials != general_token:
+    if not _token_matches(credentials.credentials, flxtime_token) and not _token_matches(credentials.credentials, general_token):
         request.state.auth_note = "INVALID TOKEN"
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -355,7 +368,7 @@ def verify_bearer_token_general(request: Request, credentials: HTTPAuthorization
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    if credentials.credentials != expected_token:
+    if not _token_matches(credentials.credentials, expected_token):
         request.state.auth_note = "INVALID TOKEN"
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -388,7 +401,7 @@ def verify_bearer_token_admin(request: Request, credentials: HTTPAuthorizationCr
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if credentials.credentials != admin_token:
+    if not _token_matches(credentials.credentials, admin_token):
         request.state.auth_note = "INVALID TOKEN"
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -423,7 +436,7 @@ def verify_bearer_token_dropwireless(request: Request, credentials: HTTPAuthoriz
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    if credentials.credentials != expected_token:
+    if not _token_matches(credentials.credentials, expected_token):
         request.state.auth_note = "INVALID TOKEN"
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -459,10 +472,10 @@ def verify_bearer_token_leases(request: Request, credentials: HTTPAuthorizationC
         )
 
     provided = credentials.credentials
-    if general_token and provided == general_token:
+    if _token_matches(provided, general_token):
         request.state.auth_note = "OK"
         return provided
-    if dropwireless_token and provided == dropwireless_token:
+    if _token_matches(provided, dropwireless_token):
         request.state.auth_note = "OK"
         return provided
 
@@ -481,13 +494,13 @@ def verify_device_or_shared_token(
         raise HTTPException(status_code=401, detail="Missing authorization")
     token = credentials.credentials
     shared = os.environ.get("API_BEARER_TOKEN", "")
-    if shared and token == shared:
+    if _token_matches(token, shared):
         return token
     fem_token = os.environ.get("FEM_API_TOKEN", "")
-    if fem_token and token == fem_token:
+    if _token_matches(token, fem_token):
         return token
     legacy = os.environ.get("API_BEARER_TOKEN_LEGACY", "")
-    if legacy and token == legacy:
+    if _token_matches(token, legacy):
         return token
     if token.startswith("fem_") and len(token) == 68:
         if STORE.verify_device_token(hash_device_token(token)):
@@ -504,10 +517,10 @@ def verify_device_or_shared_token_no_fem(
         raise HTTPException(status_code=401, detail="Missing authorization")
     token = credentials.credentials
     shared = os.environ.get("API_BEARER_TOKEN", "")
-    if shared and token == shared:
+    if _token_matches(token, shared):
         return token
     legacy = os.environ.get("API_BEARER_TOKEN_LEGACY", "")
-    if legacy and token == legacy:
+    if _token_matches(token, legacy):
         return token
     if token.startswith("fem_") and len(token) == 68:
         if STORE.verify_device_token(hash_device_token(token)):
@@ -523,10 +536,10 @@ def verify_device_or_lease_token(
     token = credentials.credentials
     for env_key in ("API_BEARER_TOKEN", "API_BEARER_TOKEN_DROPWIRELESS"):
         shared = os.environ.get(env_key, "")
-        if shared and token == shared:
+        if _token_matches(token, shared):
             return token
     fem_token = os.environ.get("FEM_API_TOKEN", "")
-    if fem_token and token == fem_token:
+    if _token_matches(token, fem_token):
         return token
     if token.startswith("fem_") and len(token) == 68:
         if STORE.verify_device_token(hash_device_token(token)):
@@ -1358,17 +1371,17 @@ def _detect_token_role(request: Request) -> str:
         dropwireless_token = os.getenv("API_BEARER_TOKEN_DROPWIRELESS")
         
         # Check admin first (highest privilege)
-        if admin_token and token == admin_token:
+        if _token_matches(token, admin_token):
             return "admin"
         # Check FlxTime
-        if flxtime_token and token == flxtime_token:
+        if _token_matches(token, flxtime_token):
             return "flxtime"
         # Check general (fallback for FlxTime if needed)
-        if general_token and token == general_token:
+        if _token_matches(token, general_token):
             # General token can access FlxTime endpoints too
             return "general"
         # Check DropWireless
-        if dropwireless_token and token == dropwireless_token:
+        if _token_matches(token, dropwireless_token):
             return "dropwireless"
         
         return "public"
@@ -2287,7 +2300,7 @@ def upsert_installation(
     if not is_fem:
         # Non-FEM keys require shared bearer token
         expected = os.environ.get("API_BEARER_TOKEN", "")
-        if not credentials or credentials.credentials != expected:
+        if not credentials or not _token_matches(credentials.credentials, expected):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid authentication token",
